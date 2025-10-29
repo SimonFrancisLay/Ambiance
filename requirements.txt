@@ -1,7 +1,8 @@
 streamlit>=1.38
 librosa>=0.10
 moviepy>=1.0.3
-imageio[ffmpeg]>=2.34
+imageio>=2.34
+imageio-ffmpeg>=0.4.9
 pillow>=10.0
 numpy>=1.24
 pandas>=2.0
