@@ -1,8 +1,7 @@
-streamlit
-librosa
-moviepy
-opencv-python
-pillow
-numpy
-scipy
-matplotlib
+streamlit>=1.38
+librosa>=0.10
+moviepy>=1.0.3
+imageio[ffmpeg]>=2.34
+pillow>=10.0
+numpy>=1.24
+pandas>=2.0
