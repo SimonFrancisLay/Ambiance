@@ -1,0 +1,8 @@
+streamlit
+librosa
+moviepy
+opencv-python
+pillow
+numpy
+scipy
+matplotlib
