@@ -38,6 +38,24 @@ def analyze_audio(y, sr, fps):
     mid_idx  = (freqs >= 200) & (freqs < 2000)
     hi_idx   = freqs >= 2000
 
+    # Global tempo estimate and beat envelope
+    # tempo: BPM, beats: frame indices (in librosa time base)
+    tempo_bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    # convert beat frame positions to time (s)
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    # build a simple "beat strength" envelope aligned with our frame_starts:
+    # for each video frame time, find distance to nearest beat in seconds.
+    frame_times_sec = frame_starts / sr
+    beat_strength = []
+    for tsec in frame_times_sec:
+        if len(beat_times) == 0:
+            beat_strength.append(0.0)
+        else:
+            dist = np.min(np.abs(beat_times - tsec))
+            # closer to beat -> stronger, exponential falloff
+            beat_strength.append(float(np.exp(-4.0 * dist)))
+    beat_strength = np.array(beat_strength)
+
     # match each time frame in S with our frame list
     for t_i in range(min(len(frame_starts), S.shape[1])):
         frame_samples = y[frame_starts[t_i]:frame_starts[t_i]+hop_length]
@@ -51,7 +69,7 @@ def analyze_audio(y, sr, fps):
         mids.append(float(np.mean(spec_col[mid_idx]) + 1e-9))
         highs.append(float(np.mean(spec_col[hi_idx]) + 1e-9))
 
-    # normalise to 0..1 for convenience
+    # normalise 0..1
     def norm(v):
         v = np.array(v)
         v = v / (np.max(v) + 1e-9)
@@ -62,97 +80,230 @@ def analyze_audio(y, sr, fps):
         "bass": norm(bass),
         "mids": norm(mids),
         "highs": norm(highs),
-        "times": frame_starts[:len(amp)] / sr
+        "times": frame_starts[:len(amp)] / sr,
+        # tempo info
+        "tempo_bpm": float(tempo_bpm),
+        # beat_strength length should match amp length
+        "beat_strength": beat_strength[:len(amp)]
     }
     return features
 
-def generate_frame(t, features, fps, imgA_np, imgB_np,
-                   warp_strength, color_shift, repeat_period,
-                   pixelation_max_block_size, scramble_max_frac):
+# --- Tempo-aware hold/crossfade helper ---
+def tempo_params(features, idx):
     """
-    Build one frame at time t.
+    Given the global tempo (BPM) and local beat strength,
+    return:
+      hold_factor   : how long to 'freeze' a frame,
+      blend_softness: how gentle the fade between held frames should be.
+    Slower tempo -> longer holds, softer blend.
+    Faster tempo -> more flicker, snappier cuts.
+    """
+    tempo_bpm = features.get("tempo_bpm", 120.0)
+    beat_local = features.get("beat_strength", [0.0])[idx]
+
+    # Map tempo to a 0..1 "slowness": 60 BPM => 1.0, 180 BPM => 0.0 (clipped)
+    slowness = np.clip((180.0 - tempo_bpm) / 120.0, 0.0, 1.0)
+
+    # base hold in seconds: between ~0.03s and ~0.3s depending on slowness
+    base_hold = 0.03 + 0.27 * slowness
+
+    # if we're near a beat (beat_local high), shorten hold to let it update
+    hold_factor = base_hold * (1.0 - 0.5 * beat_local)
+
+    # blend softness 0..1 : 0 = hard cut, 1 = very soft fade
+    blend_softness = 0.2 + 0.6 * slowness
+    # if on beat, reduce softness slightly to feel snappier
+    blend_softness *= (1.0 - 0.3 * beat_local)
+
+    return hold_factor, blend_softness
+
+def select_image_pair(t,
+                      repeat_period,
+                      imgs,
+                      randomize_images=True):
+    """
+    Decide which two images (A,B) to use for this time t.
+
+    We divide time into periods of length repeat_period.
+    For each period, pick a pair of images:
+      - if randomize_images: pseudo-random but stable for that period
+      - else: walk through imgs in order
+
+    Returns (imgA_np, imgB_np) as numpy arrays, same size.
+    """
+
+    if len(imgs) == 1:
+        # Only one image, use it for both
+        imgA_np = imgs[0]
+        imgB_np = imgs[0]
+        return imgA_np, imgB_np
+
+    period_index = int(t // repeat_period)
+
+    if randomize_images:
+        # stable random per period: seed by period index
+        rng = np.random.default_rng(seed=period_index)
+        idxs = rng.choice(len(imgs), size=2, replace=False)
+        idxA, idxB = int(idxs[0]), int(idxs[1])
+    else:
+        # sequential pair: (0->1), (1->2), ... wrap around
+        idxA = period_index % len(imgs)
+        idxB = (period_index + 1) % len(imgs)
+
+    imgA_np = imgs[idxA]
+    imgB_np = imgs[idxB]
+
+    # force same size (resize B to A's size)
+    if imgB_np.shape[:2] != imgA_np.shape[:2]:
+        pilB = Image.fromarray(imgB_np)
+        pilB = pilB.resize((imgA_np.shape[1], imgA_np.shape[0]))
+        imgB_np = np.array(pilB)
+
+    return imgA_np, imgB_np
+
+def generate_frame(t, features, fps, imgs,
+                   warp_strength, color_shift, repeat_period,
+                   pixelation_max_block_size, scramble_max_frac,
+                   randomize_images):
+    """
+    Build one frame at time t, with tempo-based hold / fade.
 
     Audio mapping:
-    - bass  : drives colour tint (red boost for now).
-    - highs : drives pixelation (high highs -> blocky).
-    - mids  : drives random scramble (<=10 percent of pixels swapped).
-
-    Visual flow:
-    1. Determine alpha inside the morph loop (repeat_period).
-    2. Crossfade imgA -> imgB.
-    3. Apply colour tint from bass.
-    4. Apply pixelation from highs.
-    5. Apply scramble from mids.
+    - bass  : colour tint.
+    - highs : block pixelation size.
+    - mids  : block scramble.
+    - tempo : how long frames persist and how soft the transition is.
     """
 
-    # safety: clamp fps index to available features
+    # safety: clamp index
     idx = int(t * fps)
     idx = min(idx, len(features["bass"]) - 1)
 
-    # 1. morph factor alpha cycles over repeat_period seconds
-    alpha = (t % repeat_period) / repeat_period
-    alpha = np.clip(alpha, 0.0, 1.0)
+    # get tempo-driven parameters
+    hold_sec, blend_soft = tempo_params(features, idx)
 
-    # base crossfade between the 2 images
-    blended = (1 - alpha) * imgA_np + alpha * imgB_np  # float math
+    # We treat the video timeline as 'keyframes' that advance every hold_sec.
+    # Snap t to previous and next hold boundaries:
+    if hold_sec <= 0:
+        hold_sec = 1.0 / fps
+    t_prev_key = np.floor(t / hold_sec) * hold_sec
+    t_next_key = t_prev_key + hold_sec
+
+    # alpha_key says where we are between these two keyframes (0..1)
+    if t_next_key == t_prev_key:
+        alpha_key = 0.0
+    else:
+        alpha_key = (t - t_prev_key) / (t_next_key - t_prev_key)
+    alpha_key = np.clip(alpha_key, 0.0, 1.0)
+
+    # soften alpha_key based on blend_soft:
+    # higher softness => smoother ease between frames
+    eased_alpha = alpha_key ** (1.0 / (1e-6 + (0.5 + 0.5 * blend_soft)))
+
+    # pick which two images we're morphing between at this moment
+    imgA_np, imgB_np = select_image_pair(
+        t_prev_key,  # keyframed time drives which pair we see
+        repeat_period,
+        imgs,
+        randomize_images=randomize_images
+    )
+
+    # For visual morph between imgA and imgB we still use musical repeat_period,
+    # but driven by the snapped key time (t_prev_key) to give that "linger".
+    alpha_morph = (t_prev_key % repeat_period) / repeat_period
+    alpha_morph = np.clip(alpha_morph, 0.0, 1.0)
+
+    # Base crossfade A->B at the snapped key (so content lags / holds),
+    # but we also blend toward the *current* morph position a little,
+    # controlled by eased_alpha, to avoid harsh steps.
+    alpha_now = (t % repeat_period) / repeat_period
+    alpha_now = np.clip(alpha_now, 0.0, 1.0)
+
+    alpha_combined = (1.0 - eased_alpha) * alpha_morph + eased_alpha * alpha_now
+
+    blended = (1 - alpha_combined) * imgA_np + alpha_combined * imgB_np
     frame = blended.astype(np.float32)
 
-    # pull feature levels
+    # pull audio band levels at idx
     b_level   = float(features["bass"][idx])
     m_level   = float(features["mids"][idx])
     h_level   = float(features["highs"][idx])
 
-    # 2. Colour tint from bass (same as before, just using frame var)
-    # boost red channel proportional to bass * color_shift
+    # Bass: tint red
     frame[..., 0] = np.clip(frame[..., 0] * (1.0 + b_level * color_shift), 0, 255)
 
-    # 3. Pixelation from highs.
-    # We compute a downsample factor between 1 (no pixelation) and pixelation_max_block_size (very blocky).
-    # h_level near 1.0 means use max block size.
+    # Treble: block pixelation (mosaic average per block)
     H, W, _ = frame.shape
-    max_factor = max(1, int(pixelation_max_block_size))
-    # linear interpolate: factor = 1 .. max_factor
-    factor = 1 + int(h_level * (max_factor - 1))
+    max_block = max(1, int(pixelation_max_block_size))
+    block_size = 1 + int(h_level * (max_block - 1))
+    if block_size < 1:
+        block_size = 1
 
-    # effective small size (W/factor, H/factor)
-    small_w = max(1, int(W / factor))
-    small_h = max(1, int(H / factor))
+    if block_size > 1:
+        pix_frame = frame.copy()
+        for y0 in range(0, H, block_size):
+            y1 = min(y0 + block_size, H)
+            for x0 in range(0, W, block_size):
+                x1 = min(x0 + block_size, W)
+                block = frame[y0:y1, x0:x1, :]
+                avg_col = block.mean(axis=(0,1), keepdims=True)
+                pix_frame[y0:y1, x0:x1, :] = avg_col
+        frame = pix_frame
 
-    if small_w < W or small_h < H:
-        pil_tmp = Image.fromarray(frame.astype(np.uint8))
-        pil_small = pil_tmp.resize((small_w, small_h), resample=Image.NEAREST)
-        pil_blocky = pil_small.resize((W, H), resample=Image.NEAREST)
-        frame = np.array(pil_blocky).astype(np.float32)
-
-    # 4. Scramble from mids.
-    # We will randomly shuffle up to scramble_max_frac of pixels.
-    # The exact fraction is 0..scramble_max_frac scaled by m_level.
+    # Mids: scramble blocks after pixelation
     scramble_frac = float(scramble_max_frac) * m_level
-    if scramble_frac > 0:
-        num_pixels = H * W
-        num_swap = int(num_pixels * scramble_frac)
+    if scramble_frac > 0 and block_size > 1:
+        num_blocks_y = int(np.ceil(H / block_size))
+        num_blocks_x = int(np.ceil(W / block_size))
+        total_blocks = num_blocks_y * num_blocks_x
+        num_swap = int(total_blocks * scramble_frac)
 
         if num_swap > 1:
-            # pick indices to swap
+            y_blocks = np.random.randint(0, num_blocks_y, size=num_swap)
+            x_blocks = np.random.randint(0, num_blocks_x, size=num_swap)
+            y_blocks2 = np.random.randint(0, num_blocks_y, size=num_swap)
+            x_blocks2 = np.random.randint(0, num_blocks_x, size=num_swap)
+
+            frame_int = frame.astype(np.uint8)
+
+            for i in range(num_swap):
+                y0 = y_blocks[i] * block_size
+                x0 = x_blocks[i] * block_size
+                y1 = min(y0 + block_size, H)
+                x1 = min(x0 + block_size, W)
+
+                y0b = y_blocks2[i] * block_size
+                x0b = x_blocks2[i] * block_size
+                y1b = min(y0b + block_size, H)
+                x1b = min(x0b + block_size, W)
+
+                if (y1 - y0 == y1b - y0b) and (x1 - x0 == x1b - x0b):
+                    tmp_block = frame_int[y0:y1, x0:x1].copy()
+                    frame_int[y0:y1, x0:x1] = frame_int[y0b:y1b, x0b:x1b]
+                    frame_int[y0b:y1b, x0b:x1b] = tmp_block
+
+            frame = frame_int.astype(np.float32)
+    elif scramble_frac > 0:
+        num_pixels = H * W
+        num_swap = int(num_pixels * scramble_frac)
+        if num_swap > 1:
             ys = np.random.randint(0, H, size=num_swap)
             xs = np.random.randint(0, W, size=num_swap)
             ys2 = np.random.randint(0, H, size=num_swap)
             xs2 = np.random.randint(0, W, size=num_swap)
-
-            # perform swap on a copy
             frame_int = frame.astype(np.uint8)
             tmp_vals = frame_int[ys, xs].copy()
             frame_int[ys, xs] = frame_int[ys2, xs2]
             frame_int[ys2, xs2] = tmp_vals
             frame = frame_int.astype(np.float32)
 
-    # TODO: Apply smooth spatial warp using warp_strength * b_level (future step).
-
     return frame.astype(np.uint8)
 
-def render_video(y, sr, features, fps, imgA_np, imgB_np,
+def render_video(y, sr, features, fps, imgs,
                  warp_strength, color_shift, repeat_period, resolution,
-                 pixelation_max_block_size, scramble_max_frac, progress_callback=None):
+                 pixelation_max_block_size, scramble_max_frac,
+                 randomize_images,
+                 progress_callback=None):
     duration_s = len(y) / sr
     W, H = resolution
 
@@ -161,15 +312,17 @@ def render_video(y, sr, features, fps, imgA_np, imgB_np,
             t,
             features,
             fps,
-            np.array(Image.fromarray(imgA_np).resize((W, H))),
-            np.array(Image.fromarray(imgB_np).resize((W, H))),
+            imgs,
             warp_strength,
             color_shift,
             repeat_period,
             pixelation_max_block_size,
-            scramble_max_frac
+            scramble_max_frac,
+            randomize_images
         )
-        return frame
+        # ensure final frame is at output resolution W x H
+        frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
+        return frame_resized
 
     clip = mpy.VideoClip(make_frame, duration=duration_s)
 
@@ -177,32 +330,33 @@ def render_video(y, sr, features, fps, imgA_np, imgB_np,
     clip = clip.set_audio(audio_clip)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        # When writing, MoviePy itself iterates frames. We can hook a callback for UI progress.
-        def _prog_cb(current_time):
-            if progress_callback is not None and duration_s > 0:
-                progress_callback(min(current_time / duration_s, 1.0))
-
+        # Older MoviePy versions do not support custom callbacks / progress_bar args.
+        # We'll just write the file, then report completion.
         clip.write_videofile(
             tmp.name,
             fps=fps,
             codec="libx264",
             audio_codec="aac",
             verbose=False,
-            logger=None,
-            progress_bar=False,
-            write_logfile=False,
-            callbacks=[("progress_bar", _prog_cb)]
+            logger=None
         )
         tmp.seek(0)
+
+        # let the UI know we're done
+        if progress_callback is not None:
+            progress_callback(1.0)
+
         return tmp.read()
 
-def render_preview_clip(features, fps, imgA_np, imgB_np,
+def render_preview_clip(y, sr,
+                        features, fps, imgs,
                         warp_strength, color_shift,
                         repeat_period,
                         start_time, duration_s,
                         preview_res=(320,180), preview_fps=15,
                         pixelation_max_block_size=10,
                         scramble_max_frac=0.1,
+                        randomize_images=True,
                         progress_callback=None):
     W, H = preview_res
 
@@ -212,35 +366,43 @@ def render_preview_clip(features, fps, imgA_np, imgB_np,
             t_abs,
             features,
             fps,
-            np.array(Image.fromarray(imgA_np).resize((W, H))),
-            np.array(Image.fromarray(imgB_np).resize((W, H))),
+            imgs,
             warp_strength,
             color_shift,
             repeat_period,
             pixelation_max_block_size,
-            scramble_max_frac
+            scramble_max_frac,
+            randomize_images
         )
-        return frame
+        frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
+        return frame_resized
 
     clip = mpy.VideoClip(make_frame_local, duration=duration_s)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        def _prog_cb(current_time):
-            if progress_callback is not None and duration_s > 0:
-                progress_callback(min(current_time / duration_s, 1.0))
+    # grab matching audio slice
+    start_sample = int(start_time * sr)
+    end_sample = int((start_time + duration_s) * sr)
+    end_sample = min(end_sample, len(y))
+    audio_slice = y[start_sample:end_sample]
 
+    if audio_slice.size > 0:
+        preview_audio = AudioArrayClip(audio_slice.reshape(-1, 1), fps=sr)
+        clip = clip.set_audio(preview_audio)
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
         clip.write_videofile(
             tmp.name,
             fps=preview_fps,
             codec="libx264",
-            audio=False,
+            audio_codec="aac",
             verbose=False,
-            logger=None,
-            progress_bar=False,
-            write_logfile=False,
-            callbacks=[("progress_bar", _prog_cb)]
+            logger=None
         )
         tmp.seek(0)
+
+        if progress_callback is not None:
+            progress_callback(1.0)
+
         return tmp.read()
 
 def download_link(data_bytes, filename, label):
@@ -267,18 +429,18 @@ warp_strength = st.sidebar.slider("Warp strength", 0.0, 2.0, 0.5, 0.01)
 color_shift   = st.sidebar.slider("Color shift from bass", 0.0, 2.0, 0.8, 0.01)
 
 pixelation_max_block_size = st.sidebar.slider(
-    "Pixelation strength (bigger = blockier)",
+    "Max pixel block size (px)",
     min_value=1,
-    max_value=20,
-    value=10,
+    max_value=100,
+    value=50,
     step=1,
-    help="At max highs, we downsample by this factor. 10 on a 320x240 frame -> 32x24 blocks."
+    help="At max treble, each block will be this many pixels wide/high."
 )
 
 scramble_max_frac = st.sidebar.slider(
     "Scramble max fraction",
     min_value=0.0,
-    max_value=0.5,
+    max_value=1.0,
     value=0.1,
     step=0.01,
     help="Max fraction of pixels to scramble at peak mids."
@@ -286,7 +448,7 @@ scramble_max_frac = st.sidebar.slider(
 
 st.sidebar.write("Morph timing etc will become editable per image pair later.")
 
-if audio_file and img_files and len(img_files) >= 2:
+if audio_file and img_files and len(img_files) >= 1:
     # Load audio
     y, sr = load_audio(audio_file.read())
     st.write(f"Audio length: {len(y)/sr:.1f} s, sample rate {sr} Hz")
@@ -328,15 +490,21 @@ if audio_file and img_files and len(img_files) >= 2:
         step=0.5
     )
 
-    # Take first two images for now
-    imgA = Image.open(img_files[0]).convert("RGB")
-    imgB = Image.open(img_files[1]).convert("RGB")
+    # Load all uploaded images
+    pil_imgs = [Image.open(f).convert("RGB") for f in img_files]
 
-    # force same size
-    imgB = imgB.resize(imgA.size)
+    # Force all to the size of the first image for consistent blending
+    base_w, base_h = pil_imgs[0].size
+    pil_imgs_resized = [im.resize((base_w, base_h)) for im in pil_imgs]
 
-    imgA_np = np.array(imgA)
-    imgB_np = np.array(imgB)
+    # Convert to numpy arrays
+    imgs = [np.array(im) for im in pil_imgs_resized]
+
+    # UI toggle: random or sequential cycling
+    randomize_images = st.sidebar.checkbox(
+        "Randomize image pairs each period",
+        value=True
+    )
 
     
 
@@ -347,10 +515,10 @@ if audio_file and img_files and len(img_files) >= 2:
         def preview_cb(p):
             preview_progress.progress(p)
         clip_bytes = render_preview_clip(
+            y, sr,
             features,
             fps,
-            imgA_np,
-            imgB_np,
+            imgs,
             warp_strength,
             color_shift,
             repeat_period,
@@ -360,9 +528,9 @@ if audio_file and img_files and len(img_files) >= 2:
             preview_fps=15,
             pixelation_max_block_size=pixelation_max_block_size,
             scramble_max_frac=scramble_max_frac,
+            randomize_images=randomize_images,
             progress_callback=preview_cb
         )
-        preview_progress.progress(1.0)
         st.video(clip_bytes)
 
     st.subheader("Final render")
@@ -372,18 +540,18 @@ if audio_file and img_files and len(img_files) >= 2:
             final_progress.progress(p)
         video_bytes = render_video(
             y, sr, features, fps,
-            imgA_np, imgB_np,
+            imgs,
             warp_strength,
             color_shift,
             repeat_period,
             (width, height),
             pixelation_max_block_size,
             scramble_max_frac,
+            randomize_images,
             progress_callback=final_cb
         )
-        final_progress.progress(1.0)
         st.video(video_bytes)
         st.markdown(download_link(video_bytes, "output.mp4", "Download MP4"),
                     unsafe_allow_html=True)
 else:
-    st.info("Upload audio and at least two images to begin.")
+    st.info("Upload audio and at least one image to begin.")
