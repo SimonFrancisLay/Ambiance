@@ -1,7 +1,22 @@
-streamlit
-librosa
-moviepy
-imageio[ffmpeg]
-pillow
-numpy
-pandas
+# Core app
+streamlit==1.38.0
+
+# Audio analysis
+librosa==0.10.1
+soundfile==0.12.1
+numba==0.59.1
+llvmlite==0.42.0
+
+# Math and data
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+
+# Image and video
+moviepy==1.0.3
+imageio==2.34.0
+imageio-ffmpeg==0.4.9
+pillow==10.3.0
+
+# Optional but useful for compatibility
+tqdm==4.66.4
