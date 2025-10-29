@@ -554,4 +554,4 @@ if audio_file and img_files and len(img_files) >= 1:
         st.markdown(download_link(video_bytes, "output.mp4", "Download MP4"),
                     unsafe_allow_html=True)
 else:
-    st.info("Upload audio and at least one image to begin.")
+    st.info("Upload audio and at least one image to begin.")# trigger rebuild
