@@ -3,10 +3,12 @@ import numpy as np
 import tempfile
 import librosa
 import moviepy.editor as mpy
-from PIL import Image
+from PIL import Image, ImageDraw
 from io import BytesIO
 import base64
 from moviepy.audio.AudioClip import AudioArrayClip
+from moviepy.audio.io.AudioFileClip import AudioFileClip
+import soundfile as sf
 
 # -----------------------
 # Helpers
@@ -83,7 +85,8 @@ def analyze_audio(y, sr, fps):
         "times": frame_starts[:len(amp)] / sr,
         # tempo info
         "tempo_bpm": float(tempo_bpm),
-        # beat_strength length should match amp length
+        # beat indices and proximity
+        "beat_times": beat_times,
         "beat_strength": beat_strength[:len(amp)]
     }
     return features
@@ -161,10 +164,336 @@ def select_image_pair(t,
 
     return imgA_np, imgB_np
 
+
+# --- Extra geometric and color helpers ---
+def kaleidoscope(frame, wedges=6, rot=0.0):
+    """
+    Mirror wedges around center to create symmetric tiling.
+    wedges: integer >= 1
+    rot: radians, rotation of the kaleidoscope
+    """
+    H, W, _ = frame.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    cx, cy = W * 0.5, H * 0.5
+    x = xx - cx
+    y = yy - cy
+    a = np.arctan2(y, x) + rot
+    # tile angle into one wedge
+    wedge_angle = (2.0 * np.pi) / max(1, int(wedges))
+    a_tile = np.mod(a, wedge_angle)
+    r = np.sqrt(x * x + y * y)
+    X = cx + r * np.cos(a_tile)
+    Y = cy + r * np.sin(a_tile)
+    X = np.clip(X, 0, W - 1).astype(np.int32)
+    Y = np.clip(Y, 0, H - 1).astype(np.int32)
+    return frame[Y, X]
+
+def polar_warp(frame, r_amt=0.1, a_amt=0.1):
+    """
+    Simple polar-space warp: push-pull radius and swirl angle.
+    r_amt: radial distortion amount
+    a_amt: angular distortion amount
+    """
+    H, W, _ = frame.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    cx, cy = W * 0.5, H * 0.5
+    # normalize to -1..1 in the larger dimension
+    scale = float(max(W, H))
+    xn = (xx - cx) / scale
+    yn = (yy - cy) / scale
+    r = np.sqrt(xn * xn + yn * yn)
+    a = np.arctan2(yn, xn)
+    # ease radial so center moves more than edges
+    r2 = np.clip(r + r_amt * (1.0 - r * r), 0.0, 1.0)
+    a2 = a + a_amt * np.sin(6.0 * a + 4.0 * r)
+    X = cx + (r2 * np.cos(a2)) * scale
+    Y = cy + (r2 * np.sin(a2)) * scale
+    X = np.clip(X, 0, W - 1).astype(np.int32)
+    Y = np.clip(Y, 0, H - 1).astype(np.int32)
+    return frame[Y, X]
+
+def _rgb_to_hsv_np(rgb):
+    """
+    Vectorized RGB (0..255 uint8 or float) to HSV where:
+      H in degrees 0..360, S in 0..1, V in 0..1
+    """
+    f = rgb.astype(np.float32) / 255.0
+    r, g, b = f[..., 0], f[..., 1], f[..., 2]
+    cmax = np.max(f, axis=-1)
+    cmin = np.min(f, axis=-1)
+    delta = cmax - cmin + 1e-12
+
+    h = np.zeros_like(cmax)
+    mask = delta > 0
+    r_eq = (cmax == r) & mask
+    g_eq = (cmax == g) & mask
+    b_eq = (cmax == b) & mask
+
+    h[r_eq] = (60.0 * ((g[r_eq] - b[r_eq]) / delta[r_eq]) + 360.0) % 360.0
+    h[g_eq] = (60.0 * ((b[g_eq] - r[g_eq]) / delta[g_eq]) + 120.0) % 360.0
+    h[b_eq] = (60.0 * ((r[b_eq] - g[b_eq]) / delta[b_eq]) + 240.0) % 360.0
+
+    s = np.where(cmax <= 0.0, 0.0, delta / (cmax + 1e-12))
+    v = cmax
+    return h, s, v
+
+def _hsv_to_rgb_np(h, s, v):
+    """
+    HSV to RGB inverse of _rgb_to_hsv_np. H in degrees.
+    """
+    h = (h % 360.0) / 60.0  # 0..6
+    c = v * s
+    x = c * (1.0 - np.abs(np.mod(h, 2.0) - 1.0))
+    z = np.zeros_like(h)
+
+    # choose sector
+    conditions = [
+        (0 <= h) & (h < 1),
+        (1 <= h) & (h < 2),
+        (2 <= h) & (h < 3),
+        (3 <= h) & (h < 4),
+        (4 <= h) & (h < 5),
+        (5 <= h) & (h <= 6),
+    ]
+    rgb_primes = [
+        (c, x, z),
+        (x, c, z),
+        (z, c, x),
+        (z, x, c),
+        (x, z, c),
+        (c, z, x),
+    ]
+
+    rp = np.zeros_like(h)
+    gp = np.zeros_like(h)
+    bp = np.zeros_like(h)
+    for cond, (rpi, gpi, bpi) in zip(conditions, rgb_primes):
+        rp = np.where(cond, rpi, rp)
+        gp = np.where(cond, gpi, gp)
+        bp = np.where(cond, bpi, bp)
+
+    m = v - c
+    r = rp + m
+    g = gp + m
+    b = bp + m
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+def hue_shift(frame, hue_delta_deg):
+    """
+    Shift hue by hue_delta_deg degrees, keep S and V.
+    """
+    h, s, v = _rgb_to_hsv_np(frame)
+    h = (h + hue_delta_deg) % 360.0
+    return _hsv_to_rgb_np(h, s, v)
+
+def _stable_rng(name, t, idx, features, fps, beat_response, latency_base_frames, seed=12345):
+    """
+    Deterministic RNG that stays constant over a segment.
+    If beat timings are available, segments are groups of 'beat_response' beats.
+    Otherwise, segments are groups of frames whose length shortens on strong beats.
+    """
+    beat_times = features.get("beat_times", None)
+    if beat_times is not None and len(beat_times) > 0 and beat_response is not None:
+        # which beat are we currently in?
+        beat_idx = int(np.searchsorted(beat_times, t, side="right"))
+        segment = int(beat_idx // max(1, int(beat_response)))
+    else:
+        # fallback: frame-grouping based on beat strength envelope
+        beat_local = float(features.get("beat_strength", [0.0])[idx])
+        group = max(1, int(latency_base_frames * (1.2 - 0.8 * beat_local)))
+        segment = int(idx // group)
+
+    key = (str(name), int(segment), int(seed))
+    s = hash(key) & 0xFFFFFFFF
+    return np.random.default_rng(s)
+
+def _sample_normal_stable(name, mean, std_frac, t, idx, features, fps, beat_response, latency_base_frames, seed=12345, min_val=None, max_val=None):
+    """
+    Deterministic N(mean, std_frac*|mean|) sampler held constant within a segment.
+    Segment definition: every N beats (beat_response) if beat times exist, else frame grouping.
+    """
+    mean = float(mean)
+    std = abs(mean) * float(std_frac)
+    rng = _stable_rng(name, t, idx, features, fps, beat_response, latency_base_frames, seed)
+    val = float(rng.normal(loc=mean, scale=std if std > 0 else 0.0))
+    if min_val is not None:
+        val = max(min_val, val)
+    if max_val is not None:
+        val = min(max_val, val)
+    return val
+
+def _avg_complementary_color(frame):
+    """
+    Compute a complementary (inverted hue) colour based on the current frame's average hue.
+    Returns an (R,G,B) uint8 tuple.
+    """
+    h, s, v = _rgb_to_hsv_np(frame)
+    # average hue in degrees
+    h_mean = float(np.mean(h))
+    s_mean = float(np.mean(s))
+    v_mean = float(np.mean(v))
+    h_comp = (h_mean + 180.0) % 360.0
+    rgb = _hsv_to_rgb_np(np.array(h_comp, dtype=np.float32),
+                         np.array(s_mean, dtype=np.float32),
+                         np.array(v_mean, dtype=np.float32))
+    # scalar -> broadcast back then take first pixel
+    if rgb.ndim == 3:
+        r, g, b = [int(rgb[..., i].mean()) for i in range(3)]
+    else:
+        # rgb is a single pixel vector
+        r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    return (r, g, b)
+
+def _blend_overlay(base_frame, overlay_img, alpha):
+    """
+    Alpha-composite a PIL overlay over the numpy base_frame.
+    alpha 0..1 applied globally on overlay.
+    """
+    H, W, _ = base_frame.shape
+    ov = overlay_img.convert("RGBA")
+    # apply global alpha
+    a = int(np.clip(alpha, 0.0, 1.0) * 255)
+    r, g, b, _ = ov.split()
+    ov = Image.merge("RGBA", (r, g, b, Image.new("L", ov.size, a)))
+    base = Image.fromarray(base_frame.astype(np.uint8))
+    base = base.convert("RGBA")
+    base.alpha_composite(ov)
+    return np.array(base.convert("RGB"))
+
+def overlay_mandala(frame, color, complexity=8, thickness=2, opacity=0.4, seed=1234):
+    """
+    Draw a radial geometric pattern (circles + star polygons) using a complementary colour.
+    complexity: number of spokes/wedges
+    thickness: stroke width in pixels
+    opacity: 0..1
+    """
+    H, W, _ = frame.shape
+    rng = np.random.default_rng(seed)
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(ov)
+
+    cx, cy = W * 0.5, H * 0.5
+    radius = min(W, H) * 0.45
+    spokes = max(2, int(complexity))
+
+    # concentric circles
+    rings = max(2, int(2 + spokes // 2))
+    for i in range(rings):
+        r = radius * (i + 1) / rings
+        bbox = [cx - r, cy - r, cx + r, cy + r]
+        draw.ellipse(bbox, outline=color, width=int(thickness))
+
+    # star polygon
+    angles = np.linspace(0, 2 * np.pi, spokes, endpoint=False) + rng.uniform(0, np.pi / spokes)
+    pts = [(cx + radius * np.cos(a), cy + radius * np.sin(a)) for a in angles]
+    # connect every k-th point for a star look
+    k = max(1, spokes // 3)
+    for i in range(spokes):
+        j = (i + k) % spokes
+        draw.line([pts[i], pts[j]], fill=color, width=int(thickness))
+
+    return _blend_overlay(frame, ov, opacity)
+
+def overlay_tessellation(frame, color, cell=40, line_w=2, opacity=0.35):
+    """
+    Draw a grid tessellation overlay with adjustable cell size & line width.
+    """
+    H, W, _ = frame.shape
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(ov)
+
+    # vertical lines
+    x = 0
+    while x < W:
+        draw.line([(x, 0), (x, H)], fill=color, width=int(line_w))
+        x += max(4, int(cell))
+    # horizontal lines
+    y = 0
+    while y < H:
+        draw.line([(0, y), (W, y)], fill=color, width=int(line_w))
+        y += max(4, int(cell))
+
+    return _blend_overlay(frame, ov, opacity)
+
+def overlay_vector_field(frame, color, step=40, length=20, opacity=0.35):
+    """
+    Draw short line segments following image gradients sampled on a grid.
+    Uses simple Sobel-like kernels without extra deps.
+    """
+    H, W, _ = frame.shape
+    gray = (0.2126 * frame[..., 0] + 0.7152 * frame[..., 1] + 0.0722 * frame[..., 2]).astype(np.float32)
+
+    # simple gradient (Sobel-lite)
+    gx = (
+        -gray[:, :-2] - 2 * gray[:, 1:-1] - gray[:, 2:]
+        + gray[:, :-2].copy() * 0  # padding placeholder to keep shape hints
+    )
+    # rebuild gradients with padding to W,H
+    # horizontal
+    gx_full = np.zeros_like(gray)
+    gx_full[:, 1:-1] = (-gray[:, :-2] + gray[:, 2:]) * 0.5
+    # vertical
+    gy_full = np.zeros_like(gray)
+    gy_full[1:-1, :] = (-gray[:-2, :] + gray[2:, :]) * 0.5
+
+    # sample grid and draw oriented strokes
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(ov)
+    for y in range(step // 2, H, step):
+        for x in range(step // 2, W, step):
+            vx = gx_full[y, x]
+            vy = gy_full[y, x]
+            mag = np.hypot(vx, vy)
+            if mag < 1e-3:
+                continue
+            vx /= mag
+            vy /= mag
+            dx = vx * length * 0.5
+            dy = vy * length * 0.5
+            draw.line([(x - dx, y - dy), (x + dx, y + dy)], fill=color, width=1)
+    return _blend_overlay(frame, ov, opacity)
+
+def overlay_spectral_rings(frame, color, bass_level, mid_level, high_level, opacity=0.4):
+    """
+    Draw concentric rings / polygon approximations whose sizes follow band levels.
+    """
+    H, W, _ = frame.shape
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(ov)
+    cx, cy = W * 0.5, H * 0.5
+    base_r = 0.15 * min(W, H)
+    r_b = base_r * (1.0 + 1.5 * bass_level)
+    r_m = base_r * (1.0 + 1.2 * mid_level)
+    r_h = base_r * (1.0 + 1.0 * high_level)
+
+    # three rings, thicker for bass
+    draw.ellipse([cx - r_b, cy - r_b, cx + r_b, cy + r_b], outline=color, width=4)
+    draw.ellipse([cx - r_m, cy - r_m, cx + r_m, cy + r_m], outline=color, width=2)
+    # polygon for highs
+    sides = max(3, int(3 + high_level * 9))
+    ang = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+    pts = [(cx + r_h * np.cos(a), cy + r_h * np.sin(a)) for a in ang]
+    pts2 = pts + [pts[0]]
+    draw.line(pts2, fill=color, width=2)
+
+    return _blend_overlay(frame, ov, opacity)
+
 def generate_frame(t, features, fps, imgs,
                    warp_strength, color_shift, repeat_period,
                    pixelation_max_block_size, scramble_max_frac,
-                   randomize_images):
+                   randomize_images,
+                   kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
+                   polar_on, polar_r_strength, polar_a_strength,
+                   hue_on, hue_depth_deg,
+                   # randomization controls
+                   effect_randomness_pct, random_latency_frames, random_seed,
+                   beat_response,
+                   # overlays
+                   ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
+                   ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
+                   ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
+                   ov_rings_on, ov_rings_opacity):
     """
     Build one frame at time t, with tempo-based hold / fade.
 
@@ -228,6 +557,55 @@ def generate_frame(t, features, fps, imgs,
     b_level   = float(features["bass"][idx])
     m_level   = float(features["mids"][idx])
     h_level   = float(features["highs"][idx])
+
+    # local beat strength
+    beat_local = float(features.get("beat_strength", [0.0])[idx])
+
+    # randomization controls
+    std_frac = float(effect_randomness_pct) / 100.0
+    latency_base = int(max(1, random_latency_frames))
+    seed = int(random_seed)
+
+    # --- geometric layer: kaleidoscope and polar warp ---
+    if kaleido_on:
+        # base wedges respond to highs and beat
+        wedges_mean = np.clip(kaleido_base_wedges + int(h_level * 10.0 * (1.0 + 0.5 * beat_local)), 2, 32)
+        wedges_rand = _sample_normal_stable(
+            "kaleido_wedges", wedges_mean, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+            min_val=2, max_val=32
+        )
+        wedges = int(np.clip(round(wedges_rand), 2, 32))
+
+        # rotation scale is randomized around the slider value
+        rot_scale_rand = _sample_normal_stable(
+            "kaleido_rot_scale", kaleido_rot_scale, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+            min_val=0.0, max_val=1.0
+        )
+        rot = (rot_scale_rand * t) * (1.0 + 0.5 * m_level + 0.3 * beat_local)
+
+        frame = kaleidoscope(frame.astype(np.uint8), wedges=wedges, rot=rot).astype(np.float32)
+
+    if polar_on:
+        r_strength = _sample_normal_stable(
+            "polar_r_strength", polar_r_strength, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+            min_val=0.0, max_val=1.0
+        )
+        a_strength = _sample_normal_stable(
+            "polar_a_strength", polar_a_strength, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+            min_val=0.0, max_val=1.0
+        )
+        r_amt = float(r_strength) * b_level
+        a_amt = float(a_strength) * (m_level + 0.3 * beat_local)
+        frame = polar_warp(frame.astype(np.uint8), r_amt=r_amt, a_amt=a_amt).astype(np.float32)
+
+    # --- colour layer: hue shift tied to bass and a slow LFO ---
+    if hue_on:
+        hue_depth = _sample_normal_stable(
+            "hue_depth_deg", hue_depth_deg, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+            min_val=0.0, max_val=360.0
+        )
+        hue_delta = float(hue_depth) * (0.5 * b_level + 0.5 * np.sin(0.2 * t))
+        frame = hue_shift(frame.astype(np.uint8), hue_delta_deg=hue_delta).astype(np.float32)
 
     # Bass: tint red
     frame[..., 0] = np.clip(frame[..., 0] * (1.0 + b_level * color_shift), 0, 255)
@@ -297,12 +675,67 @@ def generate_frame(t, features, fps, imgs,
             frame_int[ys2, xs2] = tmp_vals
             frame = frame_int.astype(np.float32)
 
+    # --- overlays drawn last (on top) ---
+    comp_color = _avg_complementary_color(frame)
+
+    if ov_mandala_on:
+        # randomness around user controls
+        comp = max(2, int(_sample_normal_stable("ov_mandala_complexity",
+                                                ov_mandala_complexity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                min_val=2, max_val=64)))
+        thick = max(1, int(_sample_normal_stable("ov_mandala_thick",
+                                                 ov_mandala_thick, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                 min_val=1, max_val=20)))
+        op = float(np.clip(_sample_normal_stable("ov_mandala_opacity",
+                                                 ov_mandala_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
+        frame = overlay_mandala(frame, comp_color, complexity=comp, thickness=thick, opacity=op, seed=seed)
+
+    if ov_tess_on:
+        cell = max(4, int(_sample_normal_stable("ov_tess_cell",
+                                                ov_tess_cell, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                min_val=4, max_val=200)))
+        lw = max(1, int(_sample_normal_stable("ov_tess_line_w",
+                                              ov_tess_line_w, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                              min_val=1, max_val=20)))
+        op = float(np.clip(_sample_normal_stable("ov_tess_opacity",
+                                                 ov_tess_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
+        frame = overlay_tessellation(frame, comp_color, cell=cell, line_w=lw, opacity=op)
+
+    if ov_vfield_on:
+        step = max(8, int(_sample_normal_stable("ov_vf_step",
+                                                ov_vf_step, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                min_val=8, max_val=200)))
+        length = max(4, int(_sample_normal_stable("ov_vf_len",
+                                                  ov_vf_len, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                  min_val=4, max_val=200)))
+        op = float(np.clip(_sample_normal_stable("ov_vf_opacity",
+                                                 ov_vf_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
+        frame = overlay_vector_field(frame, comp_color, step=step, length=length, opacity=op)
+
+    if ov_rings_on:
+        op = float(np.clip(_sample_normal_stable("ov_rings_opacity",
+                                                 ov_rings_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
+                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
+        frame = overlay_spectral_rings(frame, comp_color, b_level, m_level, h_level, opacity=op)
+
     return frame.astype(np.uint8)
 
 def render_video(y, sr, features, fps, imgs,
                  warp_strength, color_shift, repeat_period, resolution,
                  pixelation_max_block_size, scramble_max_frac,
                  randomize_images,
+                 kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
+                 polar_on, polar_r_strength, polar_a_strength,
+                 hue_on, hue_depth_deg,
+                 effect_randomness_pct, random_latency_frames, random_seed,
+                 beat_response,
+                 ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
+                 ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
+                 ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
+                 ov_rings_on, ov_rings_opacity,
                  progress_callback=None):
     duration_s = len(y) / sr
     W, H = resolution
@@ -318,7 +751,16 @@ def render_video(y, sr, features, fps, imgs,
             repeat_period,
             pixelation_max_block_size,
             scramble_max_frac,
-            randomize_images
+            randomize_images,
+            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
+            polar_on, polar_r_strength, polar_a_strength,
+            hue_on, hue_depth_deg,
+            effect_randomness_pct, random_latency_frames, random_seed,
+            beat_response,
+            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
+            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
+            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
+            ov_rings_on, ov_rings_opacity
         )
         # ensure final frame is at output resolution W x H
         frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
@@ -326,7 +768,10 @@ def render_video(y, sr, features, fps, imgs,
 
     clip = mpy.VideoClip(make_frame, duration=duration_s)
 
-    audio_clip = AudioArrayClip(y.reshape(-1, 1), fps=sr)
+    # Write full audio to a temp WAV to preserve exact SR for ffmpeg
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as aw:
+        sf.write(aw.name, y.astype(np.float32), sr)
+        audio_clip = AudioFileClip(aw.name)
     clip = clip.set_audio(audio_clip)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
@@ -357,6 +802,15 @@ def render_preview_clip(y, sr,
                         pixelation_max_block_size=10,
                         scramble_max_frac=0.1,
                         randomize_images=True,
+                        kaleido_on=True, kaleido_base_wedges=6, kaleido_rot_scale=0.05,
+                        polar_on=True, polar_r_strength=0.12, polar_a_strength=0.20,
+                        hue_on=True, hue_depth_deg=60,
+                        effect_randomness_pct=0.0, random_latency_frames=12, random_seed=12345,
+                        beat_response=1,
+                        ov_mandala_on=True, ov_mandala_complexity=8, ov_mandala_thick=2, ov_mandala_opacity=0.4,
+                        ov_tess_on=False, ov_tess_cell=40, ov_tess_line_w=2, ov_tess_opacity=0.35,
+                        ov_vfield_on=False, ov_vf_step=40, ov_vf_len=20, ov_vf_opacity=0.35,
+                        ov_rings_on=False, ov_rings_opacity=0.4,
                         progress_callback=None):
     W, H = preview_res
 
@@ -372,7 +826,16 @@ def render_preview_clip(y, sr,
             repeat_period,
             pixelation_max_block_size,
             scramble_max_frac,
-            randomize_images
+            randomize_images,
+            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
+            polar_on, polar_r_strength, polar_a_strength,
+            hue_on, hue_depth_deg,
+            effect_randomness_pct, random_latency_frames, random_seed,
+            beat_response,
+            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
+            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
+            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
+            ov_rings_on, ov_rings_opacity
         )
         frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
         return frame_resized
@@ -385,8 +848,19 @@ def render_preview_clip(y, sr,
     end_sample = min(end_sample, len(y))
     audio_slice = y[start_sample:end_sample]
 
+    # Force exact length to match preview duration
+    target_samples = int(round(duration_s * sr))
+    cur = audio_slice.shape[0]
+    if cur < target_samples:
+        pad = np.zeros((target_samples - cur,), dtype=audio_slice.dtype)
+        audio_slice = np.concatenate([audio_slice, pad], axis=0)
+    elif cur > target_samples:
+        audio_slice = audio_slice[:target_samples]
+
     if audio_slice.size > 0:
-        preview_audio = AudioArrayClip(audio_slice.reshape(-1, 1), fps=sr)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as awprev:
+            sf.write(awprev.name, audio_slice.astype(np.float32), sr)
+            preview_audio = AudioFileClip(awprev.name)
         clip = clip.set_audio(preview_audio)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
@@ -447,6 +921,59 @@ scramble_max_frac = st.sidebar.slider(
 )
 
 st.sidebar.write("Morph timing etc will become editable per image pair later.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Geometric and colour effects")
+
+kaleido_on = st.sidebar.checkbox("Enable kaleidoscope", value=True)
+kaleido_base_wedges = st.sidebar.slider("Kaleidoscope base wedges", 2, 16, 6)
+kaleido_rot_scale = st.sidebar.slider("Kaleidoscope rotation scale", 0.0, 0.2, 0.05, 0.005)
+
+polar_on = st.sidebar.checkbox("Enable polar warp", value=True)
+polar_r_strength = st.sidebar.slider("Polar radial strength", 0.0, 0.6, 0.12, 0.01)
+polar_a_strength = st.sidebar.slider("Polar angular strength", 0.0, 0.6, 0.20, 0.01)
+
+hue_on = st.sidebar.checkbox("Enable hue shift", value=True)
+hue_depth_deg = st.sidebar.slider("Hue shift depth (degrees)", 0, 180, 60, 1)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Randomization")
+effect_randomness_pct = st.sidebar.slider(
+    "Effect randomness (std % of value)", 0, 100, 20, 1,
+    help="Normal-noise std as a percent of the current control value."
+)
+random_latency_frames = st.sidebar.slider(
+    "Randomization latency (frames)", 1, 60, 12, 1,
+    help="How many frames a randomized value persists. Strong beats shorten this."
+)
+random_seed = st.sidebar.number_input(
+    "Random seed", min_value=0, max_value=10**9, value=12345, step=1
+)
+beat_response = st.sidebar.slider(
+    "Beat response (beats per change)", 1, 128, 2, 1,
+    help="1 = change every beat, 8 = change every 8th beat."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Overlays")
+
+ov_mandala_on = st.sidebar.checkbox("Overlay: mandala (complementary colour)", value=True)
+ov_mandala_complexity = st.sidebar.slider("Mandala complexity (spokes)", 2, 64, 12, 1)
+ov_mandala_thick = st.sidebar.slider("Mandala stroke width", 1, 12, 2, 1)
+ov_mandala_opacity = st.sidebar.slider("Mandala opacity", 0.0, 1.0, 0.4, 0.01)
+
+ov_tess_on = st.sidebar.checkbox("Overlay: tessellation grid", value=False)
+ov_tess_cell = st.sidebar.slider("Tessellation cell (px)", 4, 200, 48, 2)
+ov_tess_line_w = st.sidebar.slider("Tessellation line width", 1, 20, 2, 1)
+ov_tess_opacity = st.sidebar.slider("Tessellation opacity", 0.0, 1.0, 0.35, 0.01)
+
+ov_vfield_on = st.sidebar.checkbox("Overlay: vector field lines", value=False)
+ov_vf_step = st.sidebar.slider("Vector field grid step (px)", 8, 200, 40, 2)
+ov_vf_len = st.sidebar.slider("Vector field line length (px)", 4, 200, 20, 2)
+ov_vf_opacity = st.sidebar.slider("Vector field opacity", 0.0, 1.0, 0.35, 0.01)
+
+ov_rings_on = st.sidebar.checkbox("Overlay: spectral rings/polygons", value=False)
+ov_rings_opacity = st.sidebar.slider("Spectral rings opacity", 0.0, 1.0, 0.4, 0.01)
 
 if audio_file and img_files and len(img_files) >= 1:
     # Load audio
@@ -529,6 +1056,17 @@ if audio_file and img_files and len(img_files) >= 1:
             pixelation_max_block_size=pixelation_max_block_size,
             scramble_max_frac=scramble_max_frac,
             randomize_images=randomize_images,
+            kaleido_on=kaleido_on, kaleido_base_wedges=kaleido_base_wedges, kaleido_rot_scale=kaleido_rot_scale,
+            polar_on=polar_on, polar_r_strength=polar_r_strength, polar_a_strength=polar_a_strength,
+            hue_on=hue_on, hue_depth_deg=hue_depth_deg,
+            effect_randomness_pct=effect_randomness_pct,
+            random_latency_frames=random_latency_frames,
+            random_seed=random_seed,
+            beat_response=beat_response,
+            ov_mandala_on=ov_mandala_on, ov_mandala_complexity=ov_mandala_complexity, ov_mandala_thick=ov_mandala_thick, ov_mandala_opacity=ov_mandala_opacity,
+            ov_tess_on=ov_tess_on, ov_tess_cell=ov_tess_cell, ov_tess_line_w=ov_tess_line_w, ov_tess_opacity=ov_tess_opacity,
+            ov_vfield_on=ov_vfield_on, ov_vf_step=ov_vf_step, ov_vf_len=ov_vf_len, ov_vf_opacity=ov_vf_opacity,
+            ov_rings_on=ov_rings_on, ov_rings_opacity=ov_rings_opacity,
             progress_callback=preview_cb
         )
         st.video(clip_bytes)
@@ -548,6 +1086,15 @@ if audio_file and img_files and len(img_files) >= 1:
             pixelation_max_block_size,
             scramble_max_frac,
             randomize_images,
+            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
+            polar_on, polar_r_strength, polar_a_strength,
+            hue_on, hue_depth_deg,
+            effect_randomness_pct, random_latency_frames, random_seed,
+            beat_response,
+            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
+            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
+            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
+            ov_rings_on, ov_rings_opacity,
             progress_callback=final_cb
         )
         st.video(video_bytes)
