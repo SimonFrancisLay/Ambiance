@@ -1,1104 +1,848 @@
-import streamlit as st
+import io
+from typing import Dict, Tuple
+
 import numpy as np
-import tempfile
+import pandas as pd
+import streamlit as st
 import librosa
-import moviepy.editor as mpy
+import soundfile as sf  # ensures wav read support
 from PIL import Image, ImageDraw
-from io import BytesIO
-import base64
-from moviepy.audio.AudioClip import AudioArrayClip
+import moviepy.editor as mpy
 from moviepy.audio.io.AudioFileClip import AudioFileClip
-import soundfile as sf
+import tempfile, math
 
 # -----------------------
-# Helpers
+# Analysis helpers
 # -----------------------
 
-@st.cache_data
-def load_audio(file_bytes):
-    # Load audio into mono float32 and sample rate using librosa
-    y, sr = librosa.load(BytesIO(file_bytes), sr=None, mono=True)
-    return y, sr
+@st.cache_data(show_spinner=False)
+def load_audio(file_bytes: bytes) -> Tuple[np.ndarray, int]:
+    # mono, native sample rate
+    y, sr = librosa.load(io.BytesIO(file_bytes), sr=None, mono=True)
+    return y.astype(np.float32), int(sr)
 
-@st.cache_data
-def analyze_audio(y, sr, fps):
-    # Break audio into frames aligned with video frames
-    hop_length = int(sr / fps)  # samples per video frame
-    frame_starts = np.arange(0, len(y), hop_length)
-
-    amp = []
-    bass = []
-    mids = []
-    highs = []
-
-    # Precompute STFT for spectral energy
-    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop_length))**2
+@st.cache_data(show_spinner=False)
+def compute_features(y: np.ndarray, sr: int, fps: int) -> Dict[str, np.ndarray]:
+    """
+    Returns a dict of time-aligned features normalized to 0..1:
+    bass, mids, highs, vocals_proxy, beat_strength, and times.
+    """
+    hop_length = max(1, int(sr / fps))
+    # STFT power
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop_length)) ** 2
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
 
-    # frequency band indices
+    # bands
     bass_idx = freqs < 200
-    mid_idx  = (freqs >= 200) & (freqs < 2000)
-    hi_idx   = freqs >= 2000
+    mid_idx = (freqs >= 200) & (freqs < 2000)
+    high_idx = freqs >= 2000
 
-    # Global tempo estimate and beat envelope
-    # tempo: BPM, beats: frame indices (in librosa time base)
-    tempo_bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    # convert beat frame positions to time (s)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-    # build a simple "beat strength" envelope aligned with our frame_starts:
-    # for each video frame time, find distance to nearest beat in seconds.
-    frame_times_sec = frame_starts / sr
-    beat_strength = []
-    for tsec in frame_times_sec:
-        if len(beat_times) == 0:
-            beat_strength.append(0.0)
-        else:
-            dist = np.min(np.abs(beat_times - tsec))
-            # closer to beat -> stronger, exponential falloff
-            beat_strength.append(float(np.exp(-4.0 * dist)))
-    beat_strength = np.array(beat_strength)
+    # band energies over time (1-D float32)
+    bass = S[bass_idx, :].mean(axis=0).astype(np.float32).ravel()
+    mids = S[mid_idx, :].mean(axis=0).astype(np.float32).ravel()
+    highs = S[high_idx, :].mean(axis=0).astype(np.float32).ravel()
 
-    # match each time frame in S with our frame list
-    for t_i in range(min(len(frame_starts), S.shape[1])):
-        frame_samples = y[frame_starts[t_i]:frame_starts[t_i]+hop_length]
-        if len(frame_samples) == 0:
-            break
+    # vocals proxy
+    # 1) harmonic component to capture pitched content
+    y_harm = librosa.effects.hpss(y, kernel_size=31)[0]
+    Sh = np.abs(librosa.stft(y_harm, n_fft=2048, hop_length=hop_length)) ** 2
+    v_idx = (freqs >= 300) & (freqs <= 3400)
+    vocals_proxy = Sh[v_idx, :].mean(axis=0).astype(np.float32).ravel()
 
-        amp.append(float(np.sqrt(np.mean(frame_samples**2)) + 1e-9))
+    # beat curve (1-D)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length, units="frames")
+    T = onset_env.shape[0]
+    times = librosa.frames_to_time(np.arange(T), sr=sr, hop_length=hop_length)
 
-        spec_col = S[:, t_i]
-        bass.append(float(np.mean(spec_col[bass_idx]) + 1e-9))
-        mids.append(float(np.mean(spec_col[mid_idx]) + 1e-9))
-        highs.append(float(np.mean(spec_col[hi_idx]) + 1e-9))
+    if beat_frames.size > 0:
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+        # distance to nearest beat for each frame (shape: T,)
+        dists = np.min(np.abs(times[:, None] - beat_times[None, :]), axis=1)
+        beat_strength = np.exp(-5.0 * dists) * (onset_env / (onset_env.max() + 1e-9))
+    else:
+        beat_strength = onset_env.copy()
 
-    # normalise 0..1
-    def norm(v):
-        v = np.array(v)
-        v = v / (np.max(v) + 1e-9)
-        return v
+    beat_strength = beat_strength.astype(np.float32).ravel()
+    times = times.astype(np.float32).ravel()
 
-    features = {
-        "amp": norm(amp),
-        "bass": norm(bass),
-        "mids": norm(mids),
-        "highs": norm(highs),
-        "times": frame_starts[:len(amp)] / sr,
-        # tempo info
-        "tempo_bpm": float(tempo_bpm),
-        # beat indices and proximity
-        "beat_times": beat_times,
-        "beat_strength": beat_strength[:len(amp)]
+    # normalize to 0..1
+    def norm(x):
+        x = np.asarray(x, dtype=np.float32).ravel()
+        mx = float(np.max(x) + 1e-9)
+        return (x / mx).astype(np.float32)
+
+    feat = {
+        "times": times,
+        "bass": norm(bass[:len(times)]),
+        "mids": norm(mids[:len(times)]),
+        "highs": norm(highs[:len(times)]),
+        "vocals": norm(vocals_proxy[:len(times)]),
+        "beat": norm(beat_strength[:len(times)]),
+        "tempo_bpm": float(tempo),
     }
-    return features
+    return feat
 
-# --- Tempo-aware hold/crossfade helper ---
-def tempo_params(features, idx):
+def smooth_series(x: pd.Series, win_seconds: float, fps: int) -> pd.Series:
+    # window in frames
+    win_frames = max(1, int(round(win_seconds * fps)))
+    return x.rolling(win_frames, min_periods=1, center=False).mean()
+
+# -----------------------
+# UI
+# -----------------------
+
+st.title("Audio feature extractor and smoother")
+
+st.sidebar.subheader("Audio file")
+audio_file = st.sidebar.file_uploader("Drop a .wav or .mp3 here or click to browse", type=["wav", "mp3", "m4a", "ogg", "flac"])
+
+st.sidebar.subheader("Analysis settings")
+fps = st.sidebar.slider("Analysis FPS (feature frames per second)", min_value=10, max_value=100, value=50, step=5)
+
+st.sidebar.subheader("Smoothing controls")
+lock_all = st.sidebar.checkbox("Lock smoothing windows", value=True)
+
+default_win = st.sidebar.slider("All bands smoothing window (seconds)", 0.00, 20.00, 0.30, 0.05)
+
+col1, col2 = st.columns(2)
+with col1:
+    bass_win = st.slider("Bass window (s)", 0.00, 2.00, default_win, 0.05, disabled=lock_all)
+    mids_win = st.slider("Mids window (s)", 0.00, 2.00, default_win, 0.05, disabled=lock_all)
+    highs_win = st.slider("Highs window (s)", 0.00, 2.00, default_win, 0.05, disabled=lock_all)
+with col2:
+    vocals_win = st.slider("Vocals window (s)", 0.00, 2.00, default_win, 0.05, disabled=lock_all)
+    beat_win = st.slider("Beat window (s)", 0.00, 2.00, default_win, 0.05, disabled=lock_all)
+
+if audio_file is None:
+    st.info("Upload an audio file to begin")
+    st.stop()
+
+# Load and analyze
+y, sr = load_audio(audio_file.read())
+features = compute_features(y, sr, fps)
+
+# Build DataFrame with aligned, 1-D columns
+Tlen = min(
+    features["times"].shape[0],
+    features["bass"].shape[0],
+    features["mids"].shape[0],
+    features["highs"].shape[0],
+    features["vocals"].shape[0],
+    features["beat"].shape[0],
+)
+time_s = np.asarray(features["times"][:Tlen]).ravel()
+bass   = np.asarray(features["bass"][:Tlen]).ravel()
+mids   = np.asarray(features["mids"][:Tlen]).ravel()
+highs  = np.asarray(features["highs"][:Tlen]).ravel()
+vocals = np.asarray(features["vocals"][:Tlen]).ravel()
+beat   = np.asarray(features["beat"][:Tlen]).ravel()
+
+df = pd.DataFrame(
+    {"time_s": time_s, "bass": bass, "mids": mids, "highs": highs, "vocals": vocals, "beat": beat}
+).set_index("time_s")
+
+# Apply smoothing
+if lock_all:
+    bw = mw = hw = vw = bw2 = default_win
+else:
+    bw, mw, hw, vw, bw2 = bass_win, mids_win, highs_win, vocals_win, beat_win
+
+smoothed = pd.DataFrame(index=df.index)
+smoothed["bass"] = smooth_series(df["bass"], bw, fps)
+smoothed["mids"] = smooth_series(df["mids"], mw, fps)
+smoothed["highs"] = smooth_series(df["highs"], hw, fps)
+smoothed["vocals"] = smooth_series(df["vocals"], vw, fps)
+smoothed["beat"] = smooth_series(df["beat"], bw2, fps)
+
+# Show summary
+st.write(f"Sample rate: {sr} Hz. Duration: {len(y) / sr:.2f} s. Estimated tempo: {features['tempo_bpm']:.1f} BPM.")
+
+# Plot
+st.subheader("Features (smoothed)")
+# Streamlit line_chart expects a DataFrame; index is the x axis
+st.line_chart(smoothed)
+
+# Download smoothed CSV
+csv_bytes = smoothed.reset_index().rename(columns={"time_s": "time"}).to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download smoothed CSV",
+    data=csv_bytes,
+    file_name="audio_features_smoothed.csv",
+    mime="text/csv"
+)
+
+# Optional: play audio
+with st.expander("Play original audio"):
+    # Re-encode a short preview as wav bytes for playback if needed
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format="WAV")
+    st.audio(buf.getvalue(), format="audio/wav")
+
+# -----------------------
+# Geometric generators → video render (on demand)
+# -----------------------
+
+st.markdown("---")
+st.subheader("Geometric video renderer (on demand)")
+
+colA, colB = st.columns(2)
+with colA:
+    start_s = st.number_input("Start (s)", min_value=0.0, value=60.0, step=0.5, help="Start time of the segment to render.")
+with colB:
+    end_s = st.number_input("End (s)", min_value=0.1, value=70.0, step=0.5, help="End time of the segment to render.")
+
+if end_s <= start_s:
+    st.warning("End must be greater than Start.")
+    st.stop()
+
+st.sidebar.subheader("Render settings")
+render_fps = st.sidebar.slider("Render FPS", 10, 60, 30, 1)
+res_choice = st.sidebar.selectbox("Resolution", ["640x360", "854x480", "1280x720", "1920x1080"], index=1)
+W, H = map(int, res_choice.split("x"))
+
+
+st.sidebar.subheader("Generators (default OFF)")
+layer_radial = st.sidebar.checkbox("Radial polygons & rings", value=False)
+layer_spiro = st.sidebar.checkbox("Spirograph", value=False)
+layer_lissajous = st.sidebar.checkbox("Lissajous", value=False)
+layer_particles = st.sidebar.checkbox("Particle orbits", value=False)
+layer_kaleido = st.sidebar.checkbox("Kaleidoscope overlay", value=False)
+layer_flow = st.sidebar.checkbox("Flow field lines", value=False)
+layer_grid = st.sidebar.checkbox("Tessellation grid", value=False)
+layer_rings = st.sidebar.checkbox("Spectral rings/polygons", value=False)
+layer_mandala = st.sidebar.checkbox("Mandala stamps", value=False)
+
+# --- Image tessellation (dissolve) ---
+st.sidebar.subheader("Image tessellation (dissolve)")
+layer_img_tess = st.sidebar.checkbox("Enable image tessellation", value=False)
+img_file = st.sidebar.file_uploader("Image for tessellation", type=["png", "jpg", "jpeg", "bmp", "webp"], accept_multiple_files=False)
+
+# Driving mode
+tess_source = st.sidebar.selectbox("Audio source", ["beat", "bass", "mids", "highs", "vocals"], index=0)
+tess_drive_mode = st.sidebar.selectbox("Drive", ["Audio only", "LFO only", "Audio × LFO", "Audio + LFO mix"], index=0)
+tess_lfo_hz = st.sidebar.slider("LFO speed (Hz)", 0.00, 2.00, 0.20, 0.01)
+tess_mix = st.sidebar.slider("Audio/LFO mix (Audio=1)", 0.0, 1.0, 0.70, 0.01)
+
+# Columns evolve between min..max
+tess_min_cols = st.sidebar.slider("Min columns", 1, 16, 1, 1)
+tess_max_cols = st.sidebar.slider("Max columns", 1, 32, 8, 1, help="1 column is a single image; higher values create more, smaller tiles.")
+tess_response = st.sidebar.slider("Response amount", 0.0, 1.0, 0.8, 0.01, help="How strongly the drive affects density.")
+tess_smooth = st.sidebar.slider("Dissolve smoothness", 0.0, 1.0, 0.35, 0.01, help="Softens steps between column counts.")
+
+# Margin evolves between min..max
+tess_margin_min = st.sidebar.slider("Min tile margin (px)", 0, 40, 2, 1)
+tess_margin_max = st.sidebar.slider("Max tile margin (px)", 0, 60, 12, 1)
+
+# Pixelation
+tess_pixelate = st.sidebar.checkbox("Pixelate tiles", value=True)
+tess_block_min = st.sidebar.slider("Min pixel block (px)", 1, 100, 6, 1)
+tess_block_max = st.sidebar.slider("Max pixel block (px)", 4, 120, 36, 1)
+tess_pix_rand = st.sidebar.slider("Pixelate randomness (%)", 0, 100, 30, 1)
+
+# Prepare uploaded tessellation image (once)
+tess_img = None
+if layer_img_tess and img_file is not None:
+    try:
+        tess_img = Image.open(img_file).convert("RGB")
+    except Exception as e:
+        st.warning(f"Could not read image: {e}")
+        tess_img = None
+
+st.sidebar.subheader("Style")
+trail_decay = st.sidebar.slider("Trail persistence (%)", 0, 95, 60, 1)
+stroke_w = st.sidebar.slider("Base stroke width (px)", 1, 12, 2, 1)
+base_opacity = st.sidebar.slider("Layer opacity (%)", 5, 100, 60, 1)
+
+
+st.sidebar.subheader("Kinematics")
+kin_on = st.sidebar.checkbox("Enable kinematics", value=True)
+source_opts = ["none", "bass", "mids", "highs", "vocals", "beat"]
+kin_pos_src_x = st.sidebar.selectbox("Position X source", source_opts, index=1)
+kin_pos_src_y = st.sidebar.selectbox("Position Y source", source_opts, index=2)
+kin_size_src = st.sidebar.selectbox("Size source", source_opts, index=3)
+kin_rot_src = st.sidebar.selectbox("Rotation source", source_opts, index=5)
+kin_opacity_src = st.sidebar.selectbox("Opacity source", source_opts, index=0)
+kin_speed_hz = st.sidebar.slider("Motion speed (Hz)", 0.0, 1.0, 0.5, 0.01)
+kin_pos_amp_pct = st.sidebar.slider("Position amplitude (% of min dimension)", 0.0, 100.0, 20.0, 1.0)
+kin_size_range_pct = st.sidebar.slider("Size range (±%)", 0.0, 200.0, 30.0, 1.0)
+kin_rot_max_deg = st.sidebar.slider("Rotation max (deg)", 0.0, 180.0, 30.0, 1.0)
+kin_opacity_pct = st.sidebar.slider("Opacity modulation (±%)", 0.0, 100.0, 30.0, 1.0)
+
+# --- Population fill/empty ---
+st.sidebar.subheader("Population fill/empty")
+pop_enable = st.sidebar.checkbox("Enable population (stamped objects)", value=True)
+pop_source = st.sidebar.selectbox("Population source", ["vocals", "bass", "mids", "highs", "beat"], index=0, help="Controls fill (spawn) rate; low source empties the screen as objects expire.")
+pop_spawn_rate = st.sidebar.slider("Spawn rate @ source=1 (objects/sec)", 0.0, 20.0, 4.0, 0.1)
+pop_max_objs = st.sidebar.slider("Max population (objects)", 10, 2000, 400, 10)
+pop_life_sec = st.sidebar.slider("Mean lifetime (s)", 0.5, 20.0, 6.0, 0.1)
+pop_life_jitter = st.sidebar.slider("Lifetime jitter (±%)", 0.0, 100.0, 30.0, 1.0)
+pop_size_min = st.sidebar.slider("Min size (px)", 2, 200, 12, 1)
+pop_size_max = st.sidebar.slider("Max size (px)", 4, 400, 60, 1)
+pop_shapes = st.sidebar.multiselect("Stamp shapes", ["circle", "ring", "triangle", "poly"], default=["circle", "ring", "triangle"])
+pop_seed = st.sidebar.number_input("Population seed", min_value=0, max_value=10**9, value=777, step=1)
+
+# --- Per-layer kinematic variations ---
+st.sidebar.subheader("Per-layer variation")
+rand_variations = st.sidebar.checkbox("Randomize per-layer kinematic variations", value=True)
+var_seed = st.sidebar.number_input("Variation seed", min_value=0, max_value=10**9, value=2025, step=1)
+reroll_vars = st.sidebar.button("Re-roll variations")
+# --- Population system helpers ---
+
+def _rand_color_from_palette(rng):
+    return COLORS[int(rng.integers(0, len(COLORS)))]
+
+def _draw_stamp(draw: ImageDraw.ImageDraw, shape: str, cx: float, cy: float, size: float, color: tuple, alpha: int, rotation_rad: float = 0.0, stroke_w: int = 1):
+    col = color + (int(np.clip(alpha, 0, 255)),)
+    if shape == "circle":
+        r = size * 0.5
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=stroke_w)
+    elif shape == "ring":
+        r = size * 0.5
+        # outer and inner
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=max(1, stroke_w))
+        r2 = max(0, r - max(1, stroke_w*2))
+        if r2 > 0:
+            draw.ellipse([cx - r2, cy - r2, cx + r2, cy + r2], outline=col, width=1)
+    elif shape == "triangle":
+        r = size * 0.6
+        ang0 = rotation_rad
+        pts = []
+        for k in range(3):
+            ang = ang0 + 2 * math.pi * k / 3.0
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        draw.polygon(pts, outline=col, width=stroke_w)
+    else:  # "poly"
+        r = size * 0.6
+        sides = 5 + int(size) % 4  # 5..8
+        ang0 = rotation_rad
+        pts = []
+        for k in range(sides):
+            ang = ang0 + 2 * math.pi * k / sides
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        draw.polygon(pts, outline=col, width=stroke_w)
+
+def _update_population(pop_state: dict, t_abs: float, F: dict, W: int, H: int, params: dict):
     """
-    Given the global tempo (BPM) and local beat strength,
-    return:
-      hold_factor   : how long to 'freeze' a frame,
-      blend_softness: how gentle the fade between held frames should be.
-    Slower tempo -> longer holds, softer blend.
-    Faster tempo -> more flicker, snappier cuts.
+    pop_state: { 'objs': list, 'last_t': float, 'rng': Generator }
+    Each obj: { 'birth': float, 'life': float, 'x': float, 'y': float, 'size': float, 'shape': str, 'color': (r,g,b), 'rot': float }
+    params: dict with keys used below.
     """
-    tempo_bpm = features.get("tempo_bpm", 120.0)
-    beat_local = features.get("beat_strength", [0.0])[idx]
+    if not params.get("enable", False):
+            return
+    objs = pop_state["objs"]
+    rng = pop_state["rng"]
+    last_t = pop_state["last_t"]
+    if last_t is None:
+        pop_state["last_t"] = t_abs
+        return
+    dt = max(0.0, t_abs - last_t)
+    pop_state["last_t"] = t_abs
 
-    # Map tempo to a 0..1 "slowness": 60 BPM => 1.0, 180 BPM => 0.0 (clipped)
-    slowness = np.clip((180.0 - tempo_bpm) / 120.0, 0.0, 1.0)
+    # remove dead
+    alive = []
+    for o in objs:
+        age = t_abs - o["birth"]
+        if age <= o["life"]:
+            alive.append(o)
+    objs[:] = alive
 
-    # base hold in seconds: between ~0.03s and ~0.3s depending on slowness
-    base_hold = 0.03 + 0.27 * slowness
+    # spawn
+    src_val = float(F.get(params["source"], 0.0))
+    rate = float(params["spawn_rate"]) * np.clip(src_val, 0.0, 1.0)
+    expect_new = rate * dt
+    n_new = int(expect_new)
+    if rng.random() < (expect_new - n_new):
+        n_new += 1
 
-    # if we're near a beat (beat_local high), shorten hold to let it update
-    hold_factor = base_hold * (1.0 - 0.5 * beat_local)
+    # bound population
+    space = max(0, int(params["max_objs"]) - len(objs))
+    n_new = min(n_new, space)
+    if n_new <= 0:
+        return
 
-    # blend softness 0..1 : 0 = hard cut, 1 = very soft fade
-    blend_softness = 0.2 + 0.6 * slowness
-    # if on beat, reduce softness slightly to feel snappier
-    blend_softness *= (1.0 - 0.3 * beat_local)
+    shapes = params["shapes"] if params["shapes"] else ["circle"]
+    jitter = float(params["life_jitter"])
+    life_mean = float(params["life_sec"])
 
-    return hold_factor, blend_softness
+    for _ in range(n_new):
+        life = life_mean * (1.0 + (jitter / 100.0) * (rng.random() * 2 - 1))
+        life = max(0.2, life)
+        x = float(rng.integers(0, W))
+        y = float(rng.integers(0, H))
+        size = float(rng.uniform(params["size_min"], params["size_max"]))
+        shape = shapes[int(rng.integers(0, len(shapes)))]
+        color = _rand_color_from_palette(rng)
+        rot = float(rng.uniform(0, 2 * math.pi))
+        objs.append({"birth": t_abs, "life": life, "x": x, "y": y, "size": size, "shape": shape, "color": color, "rot": rot})
 
-def select_image_pair(t,
-                      repeat_period,
-                      imgs,
-                      randomize_images=True):
-    """
-    Decide which two images (A,B) to use for this time t.
+def _draw_population(draw: ImageDraw.ImageDraw, pop_state: dict, t_abs: float, opacity_scale: float = 1.0, stroke_w: int = 1):
+    objs = pop_state["objs"]
+    for o in objs:
+        age = max(0.0, t_abs - o["birth"])
+        a = 1.0 - min(1.0, age / max(1e-6, o["life"]))  # linear fade out
+        alpha = int(255 * np.clip(a * opacity_scale, 0.0, 1.0))
+        _draw_stamp(draw, o["shape"], o["x"], o["y"], o["size"], o["color"], alpha, o["rot"], stroke_w=stroke_w)
 
-    We divide time into periods of length repeat_period.
-    For each period, pick a pair of images:
-      - if randomize_images: pseudo-random but stable for that period
-      - else: walk through imgs in order
+LAYER_KEYS = [
+    ("grid", "Tessellation grid"),
+    ("radial", "Radial polygons & rings"),
+    ("rings", "Spectral rings/polygons"),
+    ("lissajous", "Lissajous"),
+    ("spiro", "Spirograph"),
+    ("particles", "Particle orbits"),
+    ("flow", "Flow field lines"),
+    ("mandala", "Mandala stamps"),
+    ("kaleido", "Kaleidoscope overlay"),
+]
 
-    Returns (imgA_np, imgB_np) as numpy arrays, same size.
-    """
-
-    if len(imgs) == 1:
-        # Only one image, use it for both
-        imgA_np = imgs[0]
-        imgB_np = imgs[0]
-        return imgA_np, imgB_np
-
-    period_index = int(t // repeat_period)
-
-    if randomize_images:
-        # stable random per period: seed by period index
-        rng = np.random.default_rng(seed=period_index)
-        idxs = rng.choice(len(imgs), size=2, replace=False)
-        idxA, idxB = int(idxs[0]), int(idxs[1])
-    else:
-        # sequential pair: (0->1), (1->2), ... wrap around
-        idxA = period_index % len(imgs)
-        idxB = (period_index + 1) % len(imgs)
-
-    imgA_np = imgs[idxA]
-    imgB_np = imgs[idxB]
-
-    # force same size (resize B to A's size)
-    if imgB_np.shape[:2] != imgA_np.shape[:2]:
-        pilB = Image.fromarray(imgB_np)
-        pilB = pilB.resize((imgA_np.shape[1], imgA_np.shape[0]))
-        imgB_np = np.array(pilB)
-
-    return imgA_np, imgB_np
-
-
-# --- Extra geometric and color helpers ---
-def kaleidoscope(frame, wedges=6, rot=0.0):
-    """
-    Mirror wedges around center to create symmetric tiling.
-    wedges: integer >= 1
-    rot: radians, rotation of the kaleidoscope
-    """
-    H, W, _ = frame.shape
-    yy, xx = np.mgrid[0:H, 0:W]
-    cx, cy = W * 0.5, H * 0.5
-    x = xx - cx
-    y = yy - cy
-    a = np.arctan2(y, x) + rot
-    # tile angle into one wedge
-    wedge_angle = (2.0 * np.pi) / max(1, int(wedges))
-    a_tile = np.mod(a, wedge_angle)
-    r = np.sqrt(x * x + y * y)
-    X = cx + r * np.cos(a_tile)
-    Y = cy + r * np.sin(a_tile)
-    X = np.clip(X, 0, W - 1).astype(np.int32)
-    Y = np.clip(Y, 0, H - 1).astype(np.int32)
-    return frame[Y, X]
-
-def polar_warp(frame, r_amt=0.1, a_amt=0.1):
-    """
-    Simple polar-space warp: push-pull radius and swirl angle.
-    r_amt: radial distortion amount
-    a_amt: angular distortion amount
-    """
-    H, W, _ = frame.shape
-    yy, xx = np.mgrid[0:H, 0:W]
-    cx, cy = W * 0.5, H * 0.5
-    # normalize to -1..1 in the larger dimension
-    scale = float(max(W, H))
-    xn = (xx - cx) / scale
-    yn = (yy - cy) / scale
-    r = np.sqrt(xn * xn + yn * yn)
-    a = np.arctan2(yn, xn)
-    # ease radial so center moves more than edges
-    r2 = np.clip(r + r_amt * (1.0 - r * r), 0.0, 1.0)
-    a2 = a + a_amt * np.sin(6.0 * a + 4.0 * r)
-    X = cx + (r2 * np.cos(a2)) * scale
-    Y = cy + (r2 * np.sin(a2)) * scale
-    X = np.clip(X, 0, W - 1).astype(np.int32)
-    Y = np.clip(Y, 0, H - 1).astype(np.int32)
-    return frame[Y, X]
-
-def _rgb_to_hsv_np(rgb):
-    """
-    Vectorized RGB (0..255 uint8 or float) to HSV where:
-      H in degrees 0..360, S in 0..1, V in 0..1
-    """
-    f = rgb.astype(np.float32) / 255.0
-    r, g, b = f[..., 0], f[..., 1], f[..., 2]
-    cmax = np.max(f, axis=-1)
-    cmin = np.min(f, axis=-1)
-    delta = cmax - cmin + 1e-12
-
-    h = np.zeros_like(cmax)
-    mask = delta > 0
-    r_eq = (cmax == r) & mask
-    g_eq = (cmax == g) & mask
-    b_eq = (cmax == b) & mask
-
-    h[r_eq] = (60.0 * ((g[r_eq] - b[r_eq]) / delta[r_eq]) + 360.0) % 360.0
-    h[g_eq] = (60.0 * ((b[g_eq] - r[g_eq]) / delta[g_eq]) + 120.0) % 360.0
-    h[b_eq] = (60.0 * ((r[b_eq] - g[b_eq]) / delta[b_eq]) + 240.0) % 360.0
-
-    s = np.where(cmax <= 0.0, 0.0, delta / (cmax + 1e-12))
-    v = cmax
-    return h, s, v
-
-def _hsv_to_rgb_np(h, s, v):
-    """
-    HSV to RGB inverse of _rgb_to_hsv_np. H in degrees.
-    """
-    h = (h % 360.0) / 60.0  # 0..6
-    c = v * s
-    x = c * (1.0 - np.abs(np.mod(h, 2.0) - 1.0))
-    z = np.zeros_like(h)
-
-    # choose sector
-    conditions = [
-        (0 <= h) & (h < 1),
-        (1 <= h) & (h < 2),
-        (2 <= h) & (h < 3),
-        (3 <= h) & (h < 4),
-        (4 <= h) & (h < 5),
-        (5 <= h) & (h <= 6),
-    ]
-    rgb_primes = [
-        (c, x, z),
-        (x, c, z),
-        (z, c, x),
-        (z, x, c),
-        (x, z, c),
-        (c, z, x),
-    ]
-
-    rp = np.zeros_like(h)
-    gp = np.zeros_like(h)
-    bp = np.zeros_like(h)
-    for cond, (rpi, gpi, bpi) in zip(conditions, rgb_primes):
-        rp = np.where(cond, rpi, rp)
-        gp = np.where(cond, gpi, gp)
-        bp = np.where(cond, bpi, bp)
-
-    m = v - c
-    r = rp + m
-    g = gp + m
-    b = bp + m
-    rgb = np.stack([r, g, b], axis=-1)
-    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-
-def hue_shift(frame, hue_delta_deg):
-    """
-    Shift hue by hue_delta_deg degrees, keep S and V.
-    """
-    h, s, v = _rgb_to_hsv_np(frame)
-    h = (h + hue_delta_deg) % 360.0
-    return _hsv_to_rgb_np(h, s, v)
-
-def _stable_rng(name, t, idx, features, fps, beat_response, latency_base_frames, seed=12345):
-    """
-    Deterministic RNG that stays constant over a segment.
-    If beat timings are available, segments are groups of 'beat_response' beats.
-    Otherwise, segments are groups of frames whose length shortens on strong beats.
-    """
-    beat_times = features.get("beat_times", None)
-    if beat_times is not None and len(beat_times) > 0 and beat_response is not None:
-        # which beat are we currently in?
-        beat_idx = int(np.searchsorted(beat_times, t, side="right"))
-        segment = int(beat_idx // max(1, int(beat_response)))
-    else:
-        # fallback: frame-grouping based on beat strength envelope
-        beat_local = float(features.get("beat_strength", [0.0])[idx])
-        group = max(1, int(latency_base_frames * (1.2 - 0.8 * beat_local)))
-        segment = int(idx // group)
-
-    key = (str(name), int(segment), int(seed))
-    s = hash(key) & 0xFFFFFFFF
-    return np.random.default_rng(s)
-
-def _sample_normal_stable(name, mean, std_frac, t, idx, features, fps, beat_response, latency_base_frames, seed=12345, min_val=None, max_val=None):
-    """
-    Deterministic N(mean, std_frac*|mean|) sampler held constant within a segment.
-    Segment definition: every N beats (beat_response) if beat times exist, else frame grouping.
-    """
-    mean = float(mean)
-    std = abs(mean) * float(std_frac)
-    rng = _stable_rng(name, t, idx, features, fps, beat_response, latency_base_frames, seed)
-    val = float(rng.normal(loc=mean, scale=std if std > 0 else 0.0))
-    if min_val is not None:
-        val = max(min_val, val)
-    if max_val is not None:
-        val = min(max_val, val)
-    return val
-
-def _avg_complementary_color(frame):
-    """
-    Compute a complementary (inverted hue) colour based on the current frame's average hue.
-    Returns an (R,G,B) uint8 tuple.
-    """
-    h, s, v = _rgb_to_hsv_np(frame)
-    # average hue in degrees
-    h_mean = float(np.mean(h))
-    s_mean = float(np.mean(s))
-    v_mean = float(np.mean(v))
-    h_comp = (h_mean + 180.0) % 360.0
-    rgb = _hsv_to_rgb_np(np.array(h_comp, dtype=np.float32),
-                         np.array(s_mean, dtype=np.float32),
-                         np.array(v_mean, dtype=np.float32))
-    # scalar -> broadcast back then take first pixel
-    if rgb.ndim == 3:
-        r, g, b = [int(rgb[..., i].mean()) for i in range(3)]
-    else:
-        # rgb is a single pixel vector
-        r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
-    return (r, g, b)
-
-def _blend_overlay(base_frame, overlay_img, alpha):
-    """
-    Alpha-composite a PIL overlay over the numpy base_frame.
-    alpha 0..1 applied globally on overlay.
-    """
-    H, W, _ = base_frame.shape
-    ov = overlay_img.convert("RGBA")
-    # apply global alpha
-    a = int(np.clip(alpha, 0.0, 1.0) * 255)
-    r, g, b, _ = ov.split()
-    ov = Image.merge("RGBA", (r, g, b, Image.new("L", ov.size, a)))
-    base = Image.fromarray(base_frame.astype(np.uint8))
-    base = base.convert("RGBA")
-    base.alpha_composite(ov)
-    return np.array(base.convert("RGB"))
-
-def overlay_mandala(frame, color, complexity=8, thickness=2, opacity=0.4, seed=1234):
-    """
-    Draw a radial geometric pattern (circles + star polygons) using a complementary colour.
-    complexity: number of spokes/wedges
-    thickness: stroke width in pixels
-    opacity: 0..1
-    """
-    H, W, _ = frame.shape
+def _build_layer_variations(seed: int, use_random: bool) -> dict:
     rng = np.random.default_rng(seed)
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(ov)
+    # candidate sources to override from; exclude "none"
+    sources = ["bass", "mids", "highs", "vocals", "beat"]
+    vars_dict = {}
+    for i, (key, _label) in enumerate(LAYER_KEYS):
+        cfg = {
+            # axis behaviour
+            "swap_xy": False,
+            "invert_x": False,
+            "invert_y": False,
+            # parameter inversions
+            "invert_size": False,
+            "invert_rot": False,
+            "invert_opacity": False,
+            # optional source overrides (None = use global selection)
+            "src_x": None,
+            "src_y": None,
+            "src_size": None,
+            "src_rot": None,
+            "src_opacity": None,
+        }
+        if use_random:
+            # alternate signs across layers to create contrast
+            cfg["invert_x"] = bool(rng.integers(0, 2))
+            cfg["invert_y"] = bool(rng.integers(0, 2))
+            cfg["swap_xy"] = bool(rng.integers(0, 2))
+            cfg["invert_size"] = bool(rng.integers(0, 2))
+            cfg["invert_rot"] = bool(rng.integers(0, 2))
+            cfg["invert_opacity"] = bool(rng.integers(0, 2))
+            # with some probability, remap sources
+            if rng.random() < 0.35:
+                cfg["src_x"] = sources[int(rng.integers(0, len(sources)))]
+            if rng.random() < 0.35:
+                cfg["src_y"] = sources[int(rng.integers(0, len(sources)))]
+            if rng.random() < 0.25:
+                cfg["src_size"] = sources[int(rng.integers(0, len(sources)))]
+            if rng.random() < 0.25:
+                cfg["src_rot"] = sources[int(rng.integers(0, len(sources)))]
+            if rng.random() < 0.25:
+                cfg["src_opacity"] = sources[int(rng.integers(0, len(sources)))]
+        vars_dict[key] = cfg
+    return vars_dict
 
-    cx, cy = W * 0.5, H * 0.5
-    radius = min(W, H) * 0.45
-    spokes = max(2, int(complexity))
+# Initialize / reroll session state
+if "layer_vars" not in st.session_state:
+    st.session_state["layer_vars"] = _build_layer_variations(var_seed, rand_variations)
+elif reroll_vars:
+    st.session_state["layer_vars"] = _build_layer_variations(var_seed, rand_variations)
+elif st.session_state.get("layer_vars_seed") != var_seed or st.session_state.get("layer_vars_flag") != rand_variations:
+    st.session_state["layer_vars"] = _build_layer_variations(var_seed, rand_variations)
 
-    # concentric circles
-    rings = max(2, int(2 + spokes // 2))
-    for i in range(rings):
-        r = radius * (i + 1) / rings
-        bbox = [cx - r, cy - r, cx + r, cy + r]
-        draw.ellipse(bbox, outline=color, width=int(thickness))
+st.session_state["layer_vars_seed"] = var_seed
+st.session_state["layer_vars_flag"] = rand_variations
 
-    # star polygon
-    angles = np.linspace(0, 2 * np.pi, spokes, endpoint=False) + rng.uniform(0, np.pi / spokes)
-    pts = [(cx + radius * np.cos(a), cy + radius * np.sin(a)) for a in angles]
-    # connect every k-th point for a star look
-    k = max(1, spokes // 3)
-    for i in range(spokes):
-        j = (i + k) % spokes
-        draw.line([pts[i], pts[j]], fill=color, width=int(thickness))
+layer_vars = st.session_state["layer_vars"]
 
-    return _blend_overlay(frame, ov, opacity)
+# Build fast feature interpolators from smoothed curves
+idx_times = smoothed.index.values.astype(np.float32)
+vals = {k: smoothed[k].values.astype(np.float32) for k in ["bass", "mids", "highs", "vocals", "beat"]}
 
-def overlay_tessellation(frame, color, cell=40, line_w=2, opacity=0.35):
+def feat_at(t: float):
+    t_clamped = float(np.clip(t, idx_times[0], idx_times[-1]))
+    out = {}
+    for k, v in vals.items():
+        out[k] = float(np.interp(t_clamped, idx_times, v))
+    return out
+
+
+# Simple palette helper
+COLORS = [(255, 200, 40), (100, 200, 255), (255, 80, 140), (120, 255, 120), (240, 240, 240)]
+
+# --- Tessellation helpers ---
+def _pixelate_np(img_np: np.ndarray, block: int) -> np.ndarray:
+    if block <= 1:
+        return img_np
+    h, w, c = img_np.shape
+    # ensure divisible
+    bw = max(1, int(block))
+    nh = max(1, h // bw)
+    nw = max(1, w // bw)
+    small = Image.fromarray(img_np).resize((nw, nh), Image.NEAREST)
+    return np.array(small.resize((w, h), Image.NEAREST))
+
+def _blend_images_rgba(base: Image.Image, overlay: Image.Image, alpha: float):
+    # alpha 0..1
+    if alpha <= 0:
+        return base
+    if alpha >= 1:
+        base.alpha_composite(overlay)
+        return base
+    ov = overlay.copy()
+    a = Image.new("L", ov.size, int(255 * np.clip(alpha, 0.0, 1.0)))
+    r, g, b, _ = ov.split()
+    ov = Image.merge("RGBA", (r, g, b, a))
+    base.alpha_composite(ov)
+    return base
+
+def _tessellate_image_layer(src_img: Image.Image, W: int, H: int, cols_float: float, margin_px: int,
+                            pixelate_on: bool, block_px: int) -> Image.Image:
     """
-    Draw a grid tessellation overlay with adjustable cell size & line width.
+    Build a grid of the source image. cols_float can be fractional; we render floor and ceil and crossfade.
     """
-    H, W, _ = frame.shape
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(ov)
+    cols_float = float(np.clip(cols_float, 1.0, max(1.0, cols_float)))
+    c0 = int(np.floor(cols_float))
+    c1 = max(1, min(int(np.ceil(cols_float)), 64))
+    frac = cols_float - c0
 
-    # vertical lines
-    x = 0
-    while x < W:
-        draw.line([(x, 0), (x, H)], fill=color, width=int(line_w))
-        x += max(4, int(cell))
-    # horizontal lines
-    y = 0
-    while y < H:
-        draw.line([(0, y), (W, y)], fill=color, width=int(line_w))
-        y += max(4, int(cell))
+    def make_grid(cols: int) -> Image.Image:
+        if cols <= 0:
+            cols = 1
+        rows = max(1, int(round(cols * H / max(1, W))))  # preserve aspect roughly square tiles
+        # compute tile size
+        tile_w = max(1, int((W - (cols + 1) * margin_px) / max(1, cols)))
+        tile_h = max(1, int((H - (rows + 1) * margin_px) / max(1, rows)))
+        # fit image into tile (contain)
+        img_fit = src_img.copy().resize((tile_w, tile_h), Image.LANCZOS)
+        # build canvas
+        grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        for r in range(rows):
+            for c in range(cols):
+                x = margin_px + c * (tile_w + margin_px)
+                y = margin_px + r * (tile_h + margin_px)
+                tile = img_fit
+                if pixelate_on and block_px > 1:
+                    np_tile = np.array(tile)
+                    np_tile = _pixelate_np(np_tile, int(block_px))
+                    tile = Image.fromarray(np_tile)
+                grid.alpha_composite(tile.convert("RGBA"), (x, y))
+        return grid
 
-    return _blend_overlay(frame, ov, opacity)
+    g0 = make_grid(c0)
+    if c1 == c0:
+        return g0
+    g1 = make_grid(c1)
+    # crossfade between c0 and c1 to create dissolve as cols_float changes
+    out = g0.copy()
+    return _blend_images_rgba(out, g1, frac)
 
-def overlay_vector_field(frame, color, step=40, length=20, opacity=0.35):
-    """
-    Draw short line segments following image gradients sampled on a grid.
-    Uses simple Sobel-like kernels without extra deps.
-    """
-    H, W, _ = frame.shape
-    gray = (0.2126 * frame[..., 0] + 0.7152 * frame[..., 1] + 0.0722 * frame[..., 2]).astype(np.float32)
+def _src(F: dict, name: str) -> float:
+    if not name or name == "none":
+        return 0.0
+    return float(F.get(name, 0.0))
 
-    # simple gradient (Sobel-lite)
-    gx = (
-        -gray[:, :-2] - 2 * gray[:, 1:-1] - gray[:, 2:]
-        + gray[:, :-2].copy() * 0  # padding placeholder to keep shape hints
+def draw_layers(draw: ImageDraw.ImageDraw, t: float, F: dict, W: int, H: int, seed: int = 123,
+                kin_on: bool = False,
+                kin_speed_hz: float = 0.5,
+                kin_pos_src_x: str = "none",
+                kin_pos_src_y: str = "none",
+                kin_size_src: str = "none",
+                kin_rot_src: str = "none",
+                kin_opacity_src: str = "none",
+                kin_pos_amp_pct: float = 20.0,
+                kin_size_range_pct: float = 30.0,
+                kin_rot_max_deg: float = 30.0,
+                kin_opacity_pct: float = 30.0):
+    rng = np.random.default_rng(seed + int(t * 1000))
+    base_cx, base_cy = W / 2, H / 2
+    base_r = 0.3 * min(W, H)
+    color = COLORS[int((F["bass"] + 2*F["mids"] + 3*F["highs"]) * 3) % len(COLORS)]
+    a_base = max(8, int(255 * (base_opacity / 100.0)))
+
+    # capture per-layer variations from outer scope
+    global layer_vars  # uses st.session_state['layer_vars'] via closure in render_frame
+
+    def kin_params(cfg: dict):
+        cx, cy, r_local = base_cx, base_cy, base_r
+        a_mult = 1.0
+        krot = 0.0
+        if not kin_on:
+            return cx, cy, r_local, a_base, krot
+        # choose sources (override or global)
+        src_x = cfg.get("src_x") or kin_pos_src_x
+        src_y = cfg.get("src_y") or kin_pos_src_y
+        src_size = cfg.get("src_size") or kin_size_src
+        src_rot = cfg.get("src_rot") or kin_rot_src
+        src_op = cfg.get("src_opacity") or kin_opacity_src
+
+        phase = 2.0 * math.pi * kin_speed_hz * t
+        amp_px = (kin_pos_amp_pct / 100.0) * float(min(W, H)) * 0.5
+
+        sx = 2.0 * _src(F, src_x) - 1.0
+        sy = 2.0 * _src(F, src_y) - 1.0
+        # axis swap and inversion
+        if cfg.get("swap_xy", False):
+            sx, sy = sy, sx
+        if cfg.get("invert_x", False):
+            sx = -sx
+        if cfg.get("invert_y", False):
+            sy = -sy
+
+        kx = amp_px * sx * math.sin(phase)
+        ky = amp_px * sy * math.cos(phase + math.pi * 0.25)
+        cx += kx
+        cy += ky
+
+        # size
+        sraw = (2.0 * _src(F, src_size) - 1.0)
+        if cfg.get("invert_size", False):
+            sraw = -sraw
+        kscale = 1.0 + (kin_size_range_pct / 100.0) * sraw
+        r_local *= kscale
+
+        # rotation
+        rraw = (2.0 * _src(F, src_rot) - 1.0)
+        if cfg.get("invert_rot", False):
+            rraw = -rraw
+        krot = math.radians(kin_rot_max_deg) * rraw * math.sin(phase)
+
+        # opacity
+        oraw = (2.0 * _src(F, src_op) - 1.0)
+        if cfg.get("invert_opacity", False):
+            oraw = -oraw
+        a_local = int(np.clip(a_base * (1.0 + (kin_opacity_pct / 100.0) * oraw), 8, 255))
+        return cx, cy, r_local, a_local, krot
+
+    if layer_grid:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("grid", {}))
+        cell = int(20 + 80 * F["highs"])
+        for x in range(0, W, cell):
+            draw.line([(x, 0), (x, H)], fill=color + (a,), width=1)
+        for y in range(0, H, cell):
+            draw.line([(0, y), (W, y)], fill=color + (a,), width=1)
+
+    if layer_radial:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("radial", {}))
+        spokes = max(3, int(4 + 20 * F["highs"]))
+        for i in range(3):
+            r = r_base_l * (0.4 + 0.25 * i) * (1.0 + 0.5 * F["bass"])
+            ang0 = 2 * math.pi * (i * 0.07 + 0.1 * F["mids"] * t) + krot
+            pts = [(cx + r * math.cos(ang0 + 2*math.pi*k/spokes), cy + r * math.sin(ang0 + 2*math.pi*k/spokes)) for k in range(spokes)]
+            draw.polygon(pts, outline=color + (a,), width=stroke_w)
+
+    if layer_rings:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("rings", {}))
+        for s, w in [(1.0 + 0.8*F["bass"], 4), (0.7 + 0.6*F["mids"], 2)]:
+            r = r_base_l * s
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color + (a,), width=max(1, stroke_w - (w//4)))
+
+    if layer_lissajous:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("lissajous", {}))
+        Ax = r_base_l * (0.5 + F["bass"]) ; Ay = r_base_l * (0.5 + F["mids"])
+        fx = 2 + int(5 * F["highs"]) ; fy = 3 + int(4 * F["beat"])
+        ph = 2 * math.pi * (0.1 * t)
+        pts = []
+        cosr, sinr = math.cos(krot), math.sin(krot)
+        for k in range(400):
+            tt = k / 400.0 * 2 * math.pi
+            x0 = Ax * math.sin(fx * tt + ph)
+            y0 = Ay * math.sin(fy * tt)
+            x = cx + x0 * cosr - y0 * sinr
+            y = cy + x0 * sinr + y0 * cosr
+            pts.append((x, y))
+        draw.line(pts, fill=color + (a,), width=stroke_w)
+
+    if layer_spiro:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("spiro", {}))
+        R = r_base_l * (0.4 + 0.4 * F["bass"])
+        r = R * (0.3 + 0.3 * F["mids"])
+        p = r * (0.3 + 0.5 * F["highs"])
+        pts = []
+        cosr, sinr = math.cos(krot), math.sin(krot)
+        for k in range(800):
+            t2 = k / 800.0 * 2 * math.pi
+            x0 = (R - r) * math.cos(t2) + p * math.cos(((R - r) / r) * t2)
+            y0 = (R - r) * math.sin(t2) - p * math.sin(((R - r) / r) * t2)
+            x = cx + x0 * cosr - y0 * sinr
+            y = cy + x0 * sinr + y0 * cosr
+            pts.append((x, y))
+        draw.line(pts, fill=color + (a,), width=stroke_w)
+
+    if layer_particles:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("particles", {}))
+        n = 50
+        for i in range(n):
+            ang = 2 * math.pi * (i / n + 0.05 * F["mids"] * t) + krot
+            rad = r_base_l * (0.2 + 0.6 * F["bass"]) + 20 * math.sin(ang * (2 + 4 * F["highs"]))
+            x = cx + rad * math.cos(ang)
+            y = cy + rad * math.sin(ang)
+            rdot = 2 + 3 * F["highs"]
+            draw.ellipse([x - rdot, y - rdot, x + rdot, y + rdot], outline=color + (a,), width=1)
+
+    if layer_flow:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("flow", {}))
+        step = int(30 + 60 * (1 - F["mids"]))
+        L = int(10 + 30 * F["highs"])
+        for y0 in range(step // 2, H, step):
+            for x0 in range(step // 2, W, step):
+                ang = 6.28318 * (math.sin(0.001 * x0 + 0.7 * F["mids"]) + math.cos(0.001 * y0 + 0.9 * F["bass"])) + krot
+                x1 = x0 + L * math.cos(ang)
+                y1 = y0 + L * math.sin(ang)
+                draw.line([(x0, y0), (x1, y1)], fill=color + (a,), width=1)
+
+    if layer_mandala:
+        cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("mandala", {}))
+        spokes = max(6, int(8 + 20 * F["highs"]))
+        rings = 3
+        for i in range(rings):
+            r = r_base_l * (0.2 + 0.25 * i) * (1 + 0.5 * F["bass"])
+            for k in range(spokes):
+                ang = 2 * math.pi * k / spokes + 0.5 * F["mids"] * t + krot
+                x = cx + r * math.cos(ang)
+                y = cy + r * math.sin(ang)
+                draw.line([(cx, cy), (x, y)], fill=color + (a,), width=stroke_w)
+
+    if layer_kaleido:
+        # simple 4-way mirror for now (lightweight)
+        # Optionally: cx, cy, r_base_l, a, krot = kin_params(layer_vars.get("kaleido", {}))
+        pass  # placeholder; heavy kaleidoscope can be added later
+
+
+def render_frame(t_abs: float, bg_img: Image.Image | None, trail: Image.Image | None, pop_state: dict | None, pop_params: dict | None):
+    F = feat_at(t_abs)
+    # background: solid black
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    # optional image tessellation background
+    if layer_img_tess and tess_img is not None:
+        # audio drive
+        a_val = float(F.get(tess_source, 0.0))
+        # lfo drive
+        lfo = 0.5 * (1.0 + math.sin(2.0 * math.pi * float(tess_lfo_hz) * t_abs))
+        # combine per mode
+        if tess_drive_mode == "Audio only":
+            drive = a_val
+        elif tess_drive_mode == "LFO only":
+            drive = lfo
+        elif tess_drive_mode == "Audio × LFO":
+            drive = a_val * lfo
+        else:  # "Audio + LFO mix"
+            drive = float(tess_mix) * a_val + (1.0 - float(tess_mix)) * lfo
+
+        # easing and response
+        drive = float(np.clip(drive, 0.0, 1.0))
+        eased = drive ** (1.0 - tess_smooth)
+        # columns in [min..max]
+        cmin = min(int(tess_min_cols), int(tess_max_cols))
+        cmax = max(int(tess_min_cols), int(tess_max_cols))
+        cols_target = float(cmin) + (float(cmax - cmin)) * (eased * tess_response)
+
+        # margin in [min..max]
+        mmin = min(int(tess_margin_min), int(tess_margin_max))
+        mmax = max(int(tess_margin_min), int(tess_margin_max))
+        margin_now = int(round(mmin + (mmax - mmin) * drive))
+
+        # pixel block in [min..max] with random jitter
+        bmin = max(1, int(tess_block_min))
+        bmax = max(bmin, int(tess_block_max))
+        base_block = int(round(bmin + (bmax - bmin) * drive))
+        jitter = (tess_pix_rand / 100.0) * (np.random.uniform(-1.0, 1.0))
+        block_now = int(np.clip(base_block * (1.0 + jitter), 1, 512))
+
+        grid_img = _tessellate_image_layer(
+            tess_img, W, H, cols_target, margin_now,
+            tess_pixelate, block_now
+        )
+        canvas.alpha_composite(grid_img)
+
+    # draw shapes
+    draw_layers(
+        draw, t_abs, F, W, H,
+        kin_on=kin_on,
+        kin_speed_hz=kin_speed_hz,
+        kin_pos_src_x=kin_pos_src_x,
+        kin_pos_src_y=kin_pos_src_y,
+        kin_size_src=kin_size_src,
+        kin_rot_src=kin_rot_src,
+        kin_opacity_src=kin_opacity_src,
+        kin_pos_amp_pct=kin_pos_amp_pct,
+        kin_size_range_pct=kin_size_range_pct,
+        kin_rot_max_deg=kin_rot_max_deg,
+        kin_opacity_pct=kin_opacity_pct,
     )
-    # rebuild gradients with padding to W,H
-    # horizontal
-    gx_full = np.zeros_like(gray)
-    gx_full[:, 1:-1] = (-gray[:, :-2] + gray[:, 2:]) * 0.5
-    # vertical
-    gy_full = np.zeros_like(gray)
-    gy_full[1:-1, :] = (-gray[:-2, :] + gray[2:, :]) * 0.5
 
-    # sample grid and draw oriented strokes
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(ov)
-    for y in range(step // 2, H, step):
-        for x in range(step // 2, W, step):
-            vx = gx_full[y, x]
-            vy = gy_full[y, x]
-            mag = np.hypot(vx, vy)
-            if mag < 1e-3:
-                continue
-            vx /= mag
-            vy /= mag
-            dx = vx * length * 0.5
-            dy = vy * length * 0.5
-            draw.line([(x - dx, y - dy), (x + dx, y + dy)], fill=color, width=1)
-    return _blend_overlay(frame, ov, opacity)
+    # population: update and draw
+    if pop_state is not None and pop_params is not None and pop_params.get("enable", False):
+        _update_population(pop_state, t_abs, F, W, H, pop_params)
+        _draw_population(draw, pop_state, t_abs, opacity_scale=base_opacity / 100.0, stroke_w=max(1, stroke_w))
 
-def overlay_spectral_rings(frame, color, bass_level, mid_level, high_level, opacity=0.4):
-    """
-    Draw concentric rings / polygon approximations whose sizes follow band levels.
-    """
-    H, W, _ = frame.shape
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(ov)
-    cx, cy = W * 0.5, H * 0.5
-    base_r = 0.15 * min(W, H)
-    r_b = base_r * (1.0 + 1.5 * bass_level)
-    r_m = base_r * (1.0 + 1.2 * mid_level)
-    r_h = base_r * (1.0 + 1.0 * high_level)
+    # trails: simple exponential decay
+    if trail is not None:
+        decay = max(0.0, min(0.95, trail_decay / 100.0))
+        trail = trail.convert("RGBA")
+        # blend old trail with new canvas
+        tr = trail.copy()
+        tr.putalpha(int(255 * decay))
+        canvas.alpha_composite(tr)
+    return canvas
 
-    # three rings, thicker for bass
-    draw.ellipse([cx - r_b, cy - r_b, cx + r_b, cy + r_b], outline=color, width=4)
-    draw.ellipse([cx - r_m, cy - r_m, cx + r_m, cy + r_m], outline=color, width=2)
-    # polygon for highs
-    sides = max(3, int(3 + high_level * 9))
-    ang = np.linspace(0, 2 * np.pi, sides, endpoint=False)
-    pts = [(cx + r_h * np.cos(a), cy + r_h * np.sin(a)) for a in ang]
-    pts2 = pts + [pts[0]]
-    draw.line(pts2, fill=color, width=2)
+process = st.button("Process", type="primary")
 
-    return _blend_overlay(frame, ov, opacity)
+if process:
+    # clamp bounds
+    start_s = max(0.0, float(start_s))
+    end_s = float(end_s)
+    duration = max(0.1, end_s - start_s)
 
-def generate_frame(t, features, fps, imgs,
-                   warp_strength, color_shift, repeat_period,
-                   pixelation_max_block_size, scramble_max_frac,
-                   randomize_images,
-                   kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
-                   polar_on, polar_r_strength, polar_a_strength,
-                   hue_on, hue_depth_deg,
-                   # randomization controls
-                   effect_randomness_pct, random_latency_frames, random_seed,
-                   beat_response,
-                   # overlays
-                   ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
-                   ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
-                   ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
-                   ov_rings_on, ov_rings_opacity):
-    """
-    Build one frame at time t, with tempo-based hold / fade.
+    progress = st.progress(0, text="Rendering frames...")
 
-    Audio mapping:
-    - bass  : colour tint.
-    - highs : block pixelation size.
-    - mids  : block scramble.
-    - tempo : how long frames persist and how soft the transition is.
-    """
-
-    # safety: clamp index
-    idx = int(t * fps)
-    idx = min(idx, len(features["bass"]) - 1)
-
-    # get tempo-driven parameters
-    hold_sec, blend_soft = tempo_params(features, idx)
-
-    # We treat the video timeline as 'keyframes' that advance every hold_sec.
-    # Snap t to previous and next hold boundaries:
-    if hold_sec <= 0:
-        hold_sec = 1.0 / fps
-    t_prev_key = np.floor(t / hold_sec) * hold_sec
-    t_next_key = t_prev_key + hold_sec
-
-    # alpha_key says where we are between these two keyframes (0..1)
-    if t_next_key == t_prev_key:
-        alpha_key = 0.0
-    else:
-        alpha_key = (t - t_prev_key) / (t_next_key - t_prev_key)
-    alpha_key = np.clip(alpha_key, 0.0, 1.0)
-
-    # soften alpha_key based on blend_soft:
-    # higher softness => smoother ease between frames
-    eased_alpha = alpha_key ** (1.0 / (1e-6 + (0.5 + 0.5 * blend_soft)))
-
-    # pick which two images we're morphing between at this moment
-    imgA_np, imgB_np = select_image_pair(
-        t_prev_key,  # keyframed time drives which pair we see
-        repeat_period,
-        imgs,
-        randomize_images=randomize_images
-    )
-
-    # For visual morph between imgA and imgB we still use musical repeat_period,
-    # but driven by the snapped key time (t_prev_key) to give that "linger".
-    alpha_morph = (t_prev_key % repeat_period) / repeat_period
-    alpha_morph = np.clip(alpha_morph, 0.0, 1.0)
-
-    # Base crossfade A->B at the snapped key (so content lags / holds),
-    # but we also blend toward the *current* morph position a little,
-    # controlled by eased_alpha, to avoid harsh steps.
-    alpha_now = (t % repeat_period) / repeat_period
-    alpha_now = np.clip(alpha_now, 0.0, 1.0)
-
-    alpha_combined = (1.0 - eased_alpha) * alpha_morph + eased_alpha * alpha_now
-
-    blended = (1 - alpha_combined) * imgA_np + alpha_combined * imgB_np
-    frame = blended.astype(np.float32)
-
-    # pull audio band levels at idx
-    b_level   = float(features["bass"][idx])
-    m_level   = float(features["mids"][idx])
-    h_level   = float(features["highs"][idx])
-
-    # local beat strength
-    beat_local = float(features.get("beat_strength", [0.0])[idx])
-
-    # randomization controls
-    std_frac = float(effect_randomness_pct) / 100.0
-    latency_base = int(max(1, random_latency_frames))
-    seed = int(random_seed)
-
-    # --- geometric layer: kaleidoscope and polar warp ---
-    if kaleido_on:
-        # base wedges respond to highs and beat
-        wedges_mean = np.clip(kaleido_base_wedges + int(h_level * 10.0 * (1.0 + 0.5 * beat_local)), 2, 32)
-        wedges_rand = _sample_normal_stable(
-            "kaleido_wedges", wedges_mean, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-            min_val=2, max_val=32
-        )
-        wedges = int(np.clip(round(wedges_rand), 2, 32))
-
-        # rotation scale is randomized around the slider value
-        rot_scale_rand = _sample_normal_stable(
-            "kaleido_rot_scale", kaleido_rot_scale, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-            min_val=0.0, max_val=1.0
-        )
-        rot = (rot_scale_rand * t) * (1.0 + 0.5 * m_level + 0.3 * beat_local)
-
-        frame = kaleidoscope(frame.astype(np.uint8), wedges=wedges, rot=rot).astype(np.float32)
-
-    if polar_on:
-        r_strength = _sample_normal_stable(
-            "polar_r_strength", polar_r_strength, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-            min_val=0.0, max_val=1.0
-        )
-        a_strength = _sample_normal_stable(
-            "polar_a_strength", polar_a_strength, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-            min_val=0.0, max_val=1.0
-        )
-        r_amt = float(r_strength) * b_level
-        a_amt = float(a_strength) * (m_level + 0.3 * beat_local)
-        frame = polar_warp(frame.astype(np.uint8), r_amt=r_amt, a_amt=a_amt).astype(np.float32)
-
-    # --- colour layer: hue shift tied to bass and a slow LFO ---
-    if hue_on:
-        hue_depth = _sample_normal_stable(
-            "hue_depth_deg", hue_depth_deg, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-            min_val=0.0, max_val=360.0
-        )
-        hue_delta = float(hue_depth) * (0.5 * b_level + 0.5 * np.sin(0.2 * t))
-        frame = hue_shift(frame.astype(np.uint8), hue_delta_deg=hue_delta).astype(np.float32)
-
-    # Bass: tint red
-    frame[..., 0] = np.clip(frame[..., 0] * (1.0 + b_level * color_shift), 0, 255)
-
-    # Treble: block pixelation (mosaic average per block)
-    H, W, _ = frame.shape
-    max_block = max(1, int(pixelation_max_block_size))
-    block_size = 1 + int(h_level * (max_block - 1))
-    if block_size < 1:
-        block_size = 1
-
-    if block_size > 1:
-        pix_frame = frame.copy()
-        for y0 in range(0, H, block_size):
-            y1 = min(y0 + block_size, H)
-            for x0 in range(0, W, block_size):
-                x1 = min(x0 + block_size, W)
-                block = frame[y0:y1, x0:x1, :]
-                avg_col = block.mean(axis=(0,1), keepdims=True)
-                pix_frame[y0:y1, x0:x1, :] = avg_col
-        frame = pix_frame
-
-    # Mids: scramble blocks after pixelation
-    scramble_frac = float(scramble_max_frac) * m_level
-    if scramble_frac > 0 and block_size > 1:
-        num_blocks_y = int(np.ceil(H / block_size))
-        num_blocks_x = int(np.ceil(W / block_size))
-        total_blocks = num_blocks_y * num_blocks_x
-        num_swap = int(total_blocks * scramble_frac)
-
-        if num_swap > 1:
-            y_blocks = np.random.randint(0, num_blocks_y, size=num_swap)
-            x_blocks = np.random.randint(0, num_blocks_x, size=num_swap)
-            y_blocks2 = np.random.randint(0, num_blocks_y, size=num_swap)
-            x_blocks2 = np.random.randint(0, num_blocks_x, size=num_swap)
-
-            frame_int = frame.astype(np.uint8)
-
-            for i in range(num_swap):
-                y0 = y_blocks[i] * block_size
-                x0 = x_blocks[i] * block_size
-                y1 = min(y0 + block_size, H)
-                x1 = min(x0 + block_size, W)
-
-                y0b = y_blocks2[i] * block_size
-                x0b = x_blocks2[i] * block_size
-                y1b = min(y0b + block_size, H)
-                x1b = min(x0b + block_size, W)
-
-                if (y1 - y0 == y1b - y0b) and (x1 - x0 == x1b - x0b):
-                    tmp_block = frame_int[y0:y1, x0:x1].copy()
-                    frame_int[y0:y1, x0:x1] = frame_int[y0b:y1b, x0b:x1b]
-                    frame_int[y0b:y1b, x0b:x1b] = tmp_block
-
-            frame = frame_int.astype(np.float32)
-    elif scramble_frac > 0:
-        num_pixels = H * W
-        num_swap = int(num_pixels * scramble_frac)
-        if num_swap > 1:
-            ys = np.random.randint(0, H, size=num_swap)
-            xs = np.random.randint(0, W, size=num_swap)
-            ys2 = np.random.randint(0, H, size=num_swap)
-            xs2 = np.random.randint(0, W, size=num_swap)
-            frame_int = frame.astype(np.uint8)
-            tmp_vals = frame_int[ys, xs].copy()
-            frame_int[ys, xs] = frame_int[ys2, xs2]
-            frame_int[ys2, xs2] = tmp_vals
-            frame = frame_int.astype(np.float32)
-
-    # --- overlays drawn last (on top) ---
-    comp_color = _avg_complementary_color(frame)
-
-    if ov_mandala_on:
-        # randomness around user controls
-        comp = max(2, int(_sample_normal_stable("ov_mandala_complexity",
-                                                ov_mandala_complexity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                min_val=2, max_val=64)))
-        thick = max(1, int(_sample_normal_stable("ov_mandala_thick",
-                                                 ov_mandala_thick, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                 min_val=1, max_val=20)))
-        op = float(np.clip(_sample_normal_stable("ov_mandala_opacity",
-                                                 ov_mandala_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
-        frame = overlay_mandala(frame, comp_color, complexity=comp, thickness=thick, opacity=op, seed=seed)
-
-    if ov_tess_on:
-        cell = max(4, int(_sample_normal_stable("ov_tess_cell",
-                                                ov_tess_cell, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                min_val=4, max_val=200)))
-        lw = max(1, int(_sample_normal_stable("ov_tess_line_w",
-                                              ov_tess_line_w, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                              min_val=1, max_val=20)))
-        op = float(np.clip(_sample_normal_stable("ov_tess_opacity",
-                                                 ov_tess_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
-        frame = overlay_tessellation(frame, comp_color, cell=cell, line_w=lw, opacity=op)
-
-    if ov_vfield_on:
-        step = max(8, int(_sample_normal_stable("ov_vf_step",
-                                                ov_vf_step, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                min_val=8, max_val=200)))
-        length = max(4, int(_sample_normal_stable("ov_vf_len",
-                                                  ov_vf_len, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                  min_val=4, max_val=200)))
-        op = float(np.clip(_sample_normal_stable("ov_vf_opacity",
-                                                 ov_vf_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
-        frame = overlay_vector_field(frame, comp_color, step=step, length=length, opacity=op)
-
-    if ov_rings_on:
-        op = float(np.clip(_sample_normal_stable("ov_rings_opacity",
-                                                 ov_rings_opacity, std_frac, t, idx, features, fps, beat_response, latency_base, seed,
-                                                 min_val=0.0, max_val=1.0), 0.0, 1.0))
-        frame = overlay_spectral_rings(frame, comp_color, b_level, m_level, h_level, opacity=op)
-
-    return frame.astype(np.uint8)
-
-def render_video(y, sr, features, fps, imgs,
-                 warp_strength, color_shift, repeat_period, resolution,
-                 pixelation_max_block_size, scramble_max_frac,
-                 randomize_images,
-                 kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
-                 polar_on, polar_r_strength, polar_a_strength,
-                 hue_on, hue_depth_deg,
-                 effect_randomness_pct, random_latency_frames, random_seed,
-                 beat_response,
-                 ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
-                 ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
-                 ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
-                 ov_rings_on, ov_rings_opacity,
-                 progress_callback=None):
-    duration_s = len(y) / sr
-    W, H = resolution
-
-    def make_frame(t):
-        frame = generate_frame(
-            t,
-            features,
-            fps,
-            imgs,
-            warp_strength,
-            color_shift,
-            repeat_period,
-            pixelation_max_block_size,
-            scramble_max_frac,
-            randomize_images,
-            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
-            polar_on, polar_r_strength, polar_a_strength,
-            hue_on, hue_depth_deg,
-            effect_randomness_pct, random_latency_frames, random_seed,
-            beat_response,
-            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
-            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
-            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
-            ov_rings_on, ov_rings_opacity
-        )
-        # ensure final frame is at output resolution W x H
-        frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
-        return frame_resized
-
-    clip = mpy.VideoClip(make_frame, duration=duration_s)
-
-    # Write full audio to a temp WAV to preserve exact SR for ffmpeg
+    # Prepare audio segment via temp WAV to preserve SR
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as aw:
-        sf.write(aw.name, y.astype(np.float32), sr)
+        s0 = int(start_s * sr)
+        s1 = int(end_s * sr)
+        yseg = y[s0:s1]
+        if yseg.size == 0:
+            st.error("Empty audio segment; check start/end times.")
+            st.stop()
+        sf.write(aw.name, yseg.astype(np.float32), sr)
         audio_clip = AudioFileClip(aw.name)
+
+    # Stateful trail buffer inside make_frame closure
+    trail_holder = {"img": None}
+    total_frames = int(duration * render_fps)
+
+    # Population state (persists across frames)
+    pop_state = {"objs": [], "last_t": None, "rng": np.random.default_rng(int(pop_seed))}
+    pop_params = {
+        "enable": bool(pop_enable),
+        "source": str(pop_source),
+        "spawn_rate": float(pop_spawn_rate),
+        "max_objs": int(pop_max_objs),
+        "life_sec": float(pop_life_sec),
+        "life_jitter": float(pop_life_jitter),
+        "size_min": int(pop_size_min),
+        "size_max": int(pop_size_max),
+        "shapes": list(pop_shapes),
+    }
+
+    def make_frame_local(t_local: float):
+        # t_local in [0, duration)
+        t_abs = start_s + float(t_local)
+        frame_img = render_frame(t_abs, None, trail_holder["img"], pop_state, pop_params)  # draw
+        # update trail to current canvas
+        trail_holder["img"] = frame_img.copy()
+        # update progress
+        fidx = min(total_frames - 1, int(t_local * render_fps))
+        progress.progress(min(1.0, (fidx + 1) / max(1, total_frames)), text=f"Rendering frame {fidx+1}/{total_frames}")
+        return np.array(frame_img.convert("RGB"))
+
+    clip = mpy.VideoClip(make_frame_local, duration=duration)
     clip = clip.set_audio(audio_clip)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        # Older MoviePy versions do not support custom callbacks / progress_bar args.
-        # We'll just write the file, then report completion.
-        clip.write_videofile(
-            tmp.name,
-            fps=fps,
-            codec="libx264",
-            audio_codec="aac",
-            verbose=False,
-            logger=None
-        )
-        tmp.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmpv:
+        clip.write_videofile(tmpv.name, fps=render_fps, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        data = open(tmpv.name, "rb").read()
 
-        # let the UI know we're done
-        if progress_callback is not None:
-            progress_callback(1.0)
-
-        return tmp.read()
-
-def render_preview_clip(y, sr,
-                        features, fps, imgs,
-                        warp_strength, color_shift,
-                        repeat_period,
-                        start_time, duration_s,
-                        preview_res=(320,180), preview_fps=15,
-                        pixelation_max_block_size=10,
-                        scramble_max_frac=0.1,
-                        randomize_images=True,
-                        kaleido_on=True, kaleido_base_wedges=6, kaleido_rot_scale=0.05,
-                        polar_on=True, polar_r_strength=0.12, polar_a_strength=0.20,
-                        hue_on=True, hue_depth_deg=60,
-                        effect_randomness_pct=0.0, random_latency_frames=12, random_seed=12345,
-                        beat_response=1,
-                        ov_mandala_on=True, ov_mandala_complexity=8, ov_mandala_thick=2, ov_mandala_opacity=0.4,
-                        ov_tess_on=False, ov_tess_cell=40, ov_tess_line_w=2, ov_tess_opacity=0.35,
-                        ov_vfield_on=False, ov_vf_step=40, ov_vf_len=20, ov_vf_opacity=0.35,
-                        ov_rings_on=False, ov_rings_opacity=0.4,
-                        progress_callback=None):
-    W, H = preview_res
-
-    def make_frame_local(t_local):
-        t_abs = start_time + t_local
-        frame = generate_frame(
-            t_abs,
-            features,
-            fps,
-            imgs,
-            warp_strength,
-            color_shift,
-            repeat_period,
-            pixelation_max_block_size,
-            scramble_max_frac,
-            randomize_images,
-            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
-            polar_on, polar_r_strength, polar_a_strength,
-            hue_on, hue_depth_deg,
-            effect_randomness_pct, random_latency_frames, random_seed,
-            beat_response,
-            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
-            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
-            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
-            ov_rings_on, ov_rings_opacity
-        )
-        frame_resized = np.array(Image.fromarray(frame).resize((W, H)))
-        return frame_resized
-
-    clip = mpy.VideoClip(make_frame_local, duration=duration_s)
-
-    # grab matching audio slice
-    start_sample = int(start_time * sr)
-    end_sample = int((start_time + duration_s) * sr)
-    end_sample = min(end_sample, len(y))
-    audio_slice = y[start_sample:end_sample]
-
-    # Force exact length to match preview duration
-    target_samples = int(round(duration_s * sr))
-    cur = audio_slice.shape[0]
-    if cur < target_samples:
-        pad = np.zeros((target_samples - cur,), dtype=audio_slice.dtype)
-        audio_slice = np.concatenate([audio_slice, pad], axis=0)
-    elif cur > target_samples:
-        audio_slice = audio_slice[:target_samples]
-
-    if audio_slice.size > 0:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as awprev:
-            sf.write(awprev.name, audio_slice.astype(np.float32), sr)
-            preview_audio = AudioFileClip(awprev.name)
-        clip = clip.set_audio(preview_audio)
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        clip.write_videofile(
-            tmp.name,
-            fps=preview_fps,
-            codec="libx264",
-            audio_codec="aac",
-            verbose=False,
-            logger=None
-        )
-        tmp.seek(0)
-
-        if progress_callback is not None:
-            progress_callback(1.0)
-
-        return tmp.read()
-
-def download_link(data_bytes, filename, label):
-    b64 = base64.b64encode(data_bytes).decode()
-    href = f'<a href="data:video/mp4;base64,{b64}" download="{filename}">{label}</a>'
-    return href
-
-# -----------------------
-# Streamlit UI
-# -----------------------
-
-st.title("Audio reactive video builder")
-
-st.sidebar.header("Inputs")
-
-audio_file = st.sidebar.file_uploader("Upload audio", type=["wav","mp3"])
-img_files  = st.sidebar.file_uploader("Upload images", type=["png","jpg","jpeg"], accept_multiple_files=True)
-
-fps = st.sidebar.slider("Video FPS", 15, 60, 15)
-width = st.sidebar.slider("Width (px)", 320, 1920, 320)
-height = st.sidebar.slider("Height (px)", 240, 1080, 240)
-
-warp_strength = st.sidebar.slider("Warp strength", 0.0, 2.0, 0.5, 0.01)
-color_shift   = st.sidebar.slider("Color shift from bass", 0.0, 2.0, 0.8, 0.01)
-
-pixelation_max_block_size = st.sidebar.slider(
-    "Max pixel block size (px)",
-    min_value=1,
-    max_value=100,
-    value=50,
-    step=1,
-    help="At max treble, each block will be this many pixels wide/high."
-)
-
-scramble_max_frac = st.sidebar.slider(
-    "Scramble max fraction",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.1,
-    step=0.01,
-    help="Max fraction of pixels to scramble at peak mids."
-)
-
-st.sidebar.write("Morph timing etc will become editable per image pair later.")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Geometric and colour effects")
-
-kaleido_on = st.sidebar.checkbox("Enable kaleidoscope", value=True)
-kaleido_base_wedges = st.sidebar.slider("Kaleidoscope base wedges", 2, 16, 6)
-kaleido_rot_scale = st.sidebar.slider("Kaleidoscope rotation scale", 0.0, 0.2, 0.05, 0.005)
-
-polar_on = st.sidebar.checkbox("Enable polar warp", value=True)
-polar_r_strength = st.sidebar.slider("Polar radial strength", 0.0, 0.6, 0.12, 0.01)
-polar_a_strength = st.sidebar.slider("Polar angular strength", 0.0, 0.6, 0.20, 0.01)
-
-hue_on = st.sidebar.checkbox("Enable hue shift", value=True)
-hue_depth_deg = st.sidebar.slider("Hue shift depth (degrees)", 0, 180, 60, 1)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Randomization")
-effect_randomness_pct = st.sidebar.slider(
-    "Effect randomness (std % of value)", 0, 100, 20, 1,
-    help="Normal-noise std as a percent of the current control value."
-)
-random_latency_frames = st.sidebar.slider(
-    "Randomization latency (frames)", 1, 60, 12, 1,
-    help="How many frames a randomized value persists. Strong beats shorten this."
-)
-random_seed = st.sidebar.number_input(
-    "Random seed", min_value=0, max_value=10**9, value=12345, step=1
-)
-beat_response = st.sidebar.slider(
-    "Beat response (beats per change)", 1, 128, 2, 1,
-    help="1 = change every beat, 8 = change every 8th beat."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Overlays")
-
-ov_mandala_on = st.sidebar.checkbox("Overlay: mandala (complementary colour)", value=True)
-ov_mandala_complexity = st.sidebar.slider("Mandala complexity (spokes)", 2, 64, 12, 1)
-ov_mandala_thick = st.sidebar.slider("Mandala stroke width", 1, 12, 2, 1)
-ov_mandala_opacity = st.sidebar.slider("Mandala opacity", 0.0, 1.0, 0.4, 0.01)
-
-ov_tess_on = st.sidebar.checkbox("Overlay: tessellation grid", value=False)
-ov_tess_cell = st.sidebar.slider("Tessellation cell (px)", 4, 200, 48, 2)
-ov_tess_line_w = st.sidebar.slider("Tessellation line width", 1, 20, 2, 1)
-ov_tess_opacity = st.sidebar.slider("Tessellation opacity", 0.0, 1.0, 0.35, 0.01)
-
-ov_vfield_on = st.sidebar.checkbox("Overlay: vector field lines", value=False)
-ov_vf_step = st.sidebar.slider("Vector field grid step (px)", 8, 200, 40, 2)
-ov_vf_len = st.sidebar.slider("Vector field line length (px)", 4, 200, 20, 2)
-ov_vf_opacity = st.sidebar.slider("Vector field opacity", 0.0, 1.0, 0.35, 0.01)
-
-ov_rings_on = st.sidebar.checkbox("Overlay: spectral rings/polygons", value=False)
-ov_rings_opacity = st.sidebar.slider("Spectral rings opacity", 0.0, 1.0, 0.4, 0.01)
-
-if audio_file and img_files and len(img_files) >= 1:
-    # Load audio
-    y, sr = load_audio(audio_file.read())
-    st.write(f"Audio length: {len(y)/sr:.1f} s, sample rate {sr} Hz")
-
-    # Analyse audio
-    features = analyze_audio(y, sr, fps)
-
-    import pandas as pd
-
-    st.subheader("Audio feature preview")
-
-    # Build a DataFrame indexed by time, so time becomes the x axis
-    feature_df = pd.DataFrame({
-        "bass": features["bass"],
-        "mids": features["mids"],
-        "highs": features["highs"],
-        "amp (loudness)": features["amp"],
-    }, index=features["times"])
-
-    feature_df.index.name = "time (s)"
-
-    st.line_chart(feature_df)
-
-    audio_len_s = len(y) / sr
-
-    repeat_period = st.sidebar.number_input(
-        "Repeat period (s)",
-        min_value=1.0,
-        max_value=60.0,
-        value=10.0,
-        step=1.0
-    )
-
-    start_time = st.sidebar.slider(
-        "Preview start in audio (s)",
-        min_value=0.0,
-        max_value=max(0.0, float(audio_len_s - repeat_period)),
-        value=0.0,
-        step=0.5
-    )
-
-    # Load all uploaded images
-    pil_imgs = [Image.open(f).convert("RGB") for f in img_files]
-
-    # Force all to the size of the first image for consistent blending
-    base_w, base_h = pil_imgs[0].size
-    pil_imgs_resized = [im.resize((base_w, base_h)) for im in pil_imgs]
-
-    # Convert to numpy arrays
-    imgs = [np.array(im) for im in pil_imgs_resized]
-
-    # UI toggle: random or sequential cycling
-    randomize_images = st.sidebar.checkbox(
-        "Randomize image pairs each period",
-        value=True
-    )
-
-    
-
-    st.subheader("Period preview")
-    st.write(f"From {start_time:.1f} s to {(start_time+repeat_period):.1f} s")
-    if st.button("Preview period clip"):
-        preview_progress = st.progress(0.0)
-        def preview_cb(p):
-            preview_progress.progress(p)
-        clip_bytes = render_preview_clip(
-            y, sr,
-            features,
-            fps,
-            imgs,
-            warp_strength,
-            color_shift,
-            repeat_period,
-            start_time,
-            duration_s=repeat_period,
-            preview_res=(320,180),
-            preview_fps=15,
-            pixelation_max_block_size=pixelation_max_block_size,
-            scramble_max_frac=scramble_max_frac,
-            randomize_images=randomize_images,
-            kaleido_on=kaleido_on, kaleido_base_wedges=kaleido_base_wedges, kaleido_rot_scale=kaleido_rot_scale,
-            polar_on=polar_on, polar_r_strength=polar_r_strength, polar_a_strength=polar_a_strength,
-            hue_on=hue_on, hue_depth_deg=hue_depth_deg,
-            effect_randomness_pct=effect_randomness_pct,
-            random_latency_frames=random_latency_frames,
-            random_seed=random_seed,
-            beat_response=beat_response,
-            ov_mandala_on=ov_mandala_on, ov_mandala_complexity=ov_mandala_complexity, ov_mandala_thick=ov_mandala_thick, ov_mandala_opacity=ov_mandala_opacity,
-            ov_tess_on=ov_tess_on, ov_tess_cell=ov_tess_cell, ov_tess_line_w=ov_tess_line_w, ov_tess_opacity=ov_tess_opacity,
-            ov_vfield_on=ov_vfield_on, ov_vf_step=ov_vf_step, ov_vf_len=ov_vf_len, ov_vf_opacity=ov_vf_opacity,
-            ov_rings_on=ov_rings_on, ov_rings_opacity=ov_rings_opacity,
-            progress_callback=preview_cb
-        )
-        st.video(clip_bytes)
-
-    st.subheader("Final render")
-    if st.button("Render full video"):
-        final_progress = st.progress(0.0)
-        def final_cb(p):
-            final_progress.progress(p)
-        video_bytes = render_video(
-            y, sr, features, fps,
-            imgs,
-            warp_strength,
-            color_shift,
-            repeat_period,
-            (width, height),
-            pixelation_max_block_size,
-            scramble_max_frac,
-            randomize_images,
-            kaleido_on, kaleido_base_wedges, kaleido_rot_scale,
-            polar_on, polar_r_strength, polar_a_strength,
-            hue_on, hue_depth_deg,
-            effect_randomness_pct, random_latency_frames, random_seed,
-            beat_response,
-            ov_mandala_on, ov_mandala_complexity, ov_mandala_thick, ov_mandala_opacity,
-            ov_tess_on, ov_tess_cell, ov_tess_line_w, ov_tess_opacity,
-            ov_vfield_on, ov_vf_step, ov_vf_len, ov_vf_opacity,
-            ov_rings_on, ov_rings_opacity,
-            progress_callback=final_cb
-        )
-        st.video(video_bytes)
-        st.markdown(download_link(video_bytes, "output.mp4", "Download MP4"),
-                    unsafe_allow_html=True)
-else:
-    st.info("Upload audio and at least one image to begin.")# trigger rebuild
+    st.success("Done.")
+    st.video(data)
+    st.download_button("Download video", data=data, file_name="geomart.mp4", mime="video/mp4")
