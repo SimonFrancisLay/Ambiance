@@ -213,14 +213,21 @@ layer_grid = st.sidebar.checkbox("Tessellation grid", value=False)
 layer_rings = st.sidebar.checkbox("Spectral rings/polygons", value=False)
 layer_mandala = st.sidebar.checkbox("Mandala stamps", value=False)
 
-# --- Image tessellation (dissolve) ---
+ # --- Image tessellation (dissolve) ---
 st.sidebar.subheader("Image tessellation (dissolve)")
 layer_img_tess = st.sidebar.checkbox("Enable image tessellation", value=False)
-img_file = st.sidebar.file_uploader("Image for tessellation", type=["png", "jpg", "jpeg", "bmp", "webp"], accept_multiple_files=False)
+img_files = st.sidebar.file_uploader(
+    "Image(s) for tessellation (one or many)",
+    type=["png", "jpg", "jpeg", "bmp", "webp"],
+    accept_multiple_files=True
+)
+# image selection behaviour
+tess_per_tile = st.sidebar.checkbox("Random image per tile", value=True, help="If off, one image is chosen per frame for the whole grid.")
+tess_img_seed = st.sidebar.number_input("Tessellation image seed", min_value=0, max_value=10**9, value=13579, step=1)
 
 # Driving mode
 tess_source = st.sidebar.selectbox("Audio source", ["beat", "bass", "mids", "highs", "vocals"], index=0)
-tess_drive_mode = st.sidebar.selectbox("Drive", ["Audio only", "LFO only", "Audio × LFO", "Audio + LFO mix"], index=0)
+tess_drive_mode = st.sidebar.selectbox("Drive", ["Audio only", "LFO only", "Audio × LFO", "Audio + LFO mix"], index=3)
 tess_lfo_hz = st.sidebar.slider("LFO speed (Hz)", 0.00, 2.00, 0.20, 0.01)
 tess_mix = st.sidebar.slider("Audio/LFO mix (Audio=1)", 0.0, 1.0, 0.70, 0.01)
 
@@ -238,16 +245,27 @@ tess_margin_max = st.sidebar.slider("Max tile margin (px)", 0, 60, 12, 1)
 tess_pixelate = st.sidebar.checkbox("Pixelate tiles", value=True)
 tess_block_min = st.sidebar.slider("Min pixel block (px)", 1, 100, 6, 1)
 tess_block_max = st.sidebar.slider("Max pixel block (px)", 4, 120, 36, 1)
+
 tess_pix_rand = st.sidebar.slider("Pixelate randomness (%)", 0, 100, 30, 1)
 
-# Prepare uploaded tessellation image (once)
-tess_img = None
-if layer_img_tess and img_file is not None:
-    try:
-        tess_img = Image.open(img_file).convert("RGB")
-    except Exception as e:
-        st.warning(f"Could not read image: {e}")
-        tess_img = None
+# --- Image fade controls ---
+st.sidebar.subheader("Image fade")
+img_fade_enable = st.sidebar.checkbox("Enable image fade", value=True)
+img_fade_source = st.sidebar.selectbox("Fade source", ["beat", "bass", "mids", "highs", "vocals"], index=0)
+img_fade_min = st.sidebar.slider("Min image opacity (%)", 0, 100, 10, 1)
+img_fade_max = st.sidebar.slider("Max image opacity (%)", 0, 100, 90, 1)
+img_fade_shape = st.sidebar.slider("Fade curve (0=linear, 1=sharper)", 0.0, 1.0, 0.3, 0.05)
+
+# Prepare uploaded tessellation images (once)
+tess_imgs = []
+if layer_img_tess and img_files:
+    for f in img_files:
+        try:
+            tess_imgs.append(Image.open(f).convert("RGB"))
+        except Exception as e:
+            st.warning(f"Could not read image: {e}")
+if layer_img_tess and not tess_imgs:
+    st.info("Upload at least one image to use tessellation.")
 
 st.sidebar.subheader("Style")
 trail_decay = st.sidebar.slider("Trail persistence (%)", 0, 95, 60, 1)
@@ -468,6 +486,19 @@ def feat_at(t: float):
 # Simple palette helper
 COLORS = [(255, 200, 40), (100, 200, 255), (255, 80, 140), (120, 255, 120), (240, 240, 240)]
 
+def _apply_alpha(img_rgba: Image.Image, scale: float) -> Image.Image:
+    """Multiply existing alpha by scale in 0..1 and return a new RGBA image."""
+    scale = float(np.clip(scale, 0.0, 1.0))
+    if scale >= 0.999:
+        return img_rgba
+    if scale <= 0.0:
+        return Image.new("RGBA", img_rgba.size, (0, 0, 0, 0))
+    r, g, b, a = img_rgba.split()
+    a_np = np.array(a, dtype=np.float32)
+    a_np = np.clip(a_np * scale, 0, 255).astype(np.uint8)
+    a2 = Image.fromarray(a_np, mode="L")
+    return Image.merge("RGBA", (r, g, b, a2))
+
 # --- Tessellation helpers ---
 def _pixelate_np(img_np: np.ndarray, block: int) -> np.ndarray:
     if block <= 1:
@@ -494,10 +525,12 @@ def _blend_images_rgba(base: Image.Image, overlay: Image.Image, alpha: float):
     base.alpha_composite(ov)
     return base
 
-def _tessellate_image_layer(src_img: Image.Image, W: int, H: int, cols_float: float, margin_px: int,
-                            pixelate_on: bool, block_px: int) -> Image.Image:
+def _tessellate_image_layer(src_imgs: list, W: int, H: int, cols_float: float, margin_px: int,
+                            pixelate_on: bool, block_px: int,
+                            per_tile: bool, rng: np.random.Generator) -> Image.Image:
     """
-    Build a grid of the source image. cols_float can be fractional; we render floor and ceil and crossfade.
+    Build a grid of the source images. cols_float can be fractional; we render floor and ceil and crossfade.
+    Allows multiple images and random selection.
     """
     cols_float = float(np.clip(cols_float, 1.0, max(1.0, cols_float)))
     c0 = int(np.floor(cols_float))
@@ -511,14 +544,27 @@ def _tessellate_image_layer(src_img: Image.Image, W: int, H: int, cols_float: fl
         # compute tile size
         tile_w = max(1, int((W - (cols + 1) * margin_px) / max(1, cols)))
         tile_h = max(1, int((H - (rows + 1) * margin_px) / max(1, rows)))
-        # fit image into tile (contain)
-        img_fit = src_img.copy().resize((tile_w, tile_h), Image.LANCZOS)
-        # build canvas
+
         grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+        if not src_imgs:
+            return grid
+        # choose a single image for the whole grid (per frame) if per_tile is False
+        if per_tile:
+            chosen_for_frame = None
+        else:
+            chosen_for_frame = src_imgs[int(rng.integers(0, len(src_imgs)))]
+            chosen_for_frame = chosen_for_frame.resize((tile_w, tile_h), Image.LANCZOS)
+
         for r in range(rows):
             for c in range(cols):
                 x = margin_px + c * (tile_w + margin_px)
                 y = margin_px + r * (tile_h + margin_px)
+                if per_tile:
+                    base_img = src_imgs[int(rng.integers(0, len(src_imgs)))]
+                    img_fit = base_img.resize((tile_w, tile_h), Image.LANCZOS)
+                else:
+                    img_fit = chosen_for_frame
                 tile = img_fit
                 if pixelate_on and block_px > 1:
                     np_tile = np.array(tile)
@@ -714,7 +760,7 @@ def render_frame(t_abs: float, bg_img: Image.Image | None, trail: Image.Image | 
     draw = ImageDraw.Draw(canvas, "RGBA")
 
     # optional image tessellation background
-    if layer_img_tess and tess_img is not None:
+    if layer_img_tess and tess_imgs:
         # audio drive
         a_val = float(F.get(tess_source, 0.0))
         # lfo drive
@@ -749,10 +795,20 @@ def render_frame(t_abs: float, bg_img: Image.Image | None, trail: Image.Image | 
         jitter = (tess_pix_rand / 100.0) * (np.random.uniform(-1.0, 1.0))
         block_now = int(np.clip(base_block * (1.0 + jitter), 1, 512))
 
+        rng_loc = np.random.default_rng(int(tess_img_seed + t_abs * 10_000))
         grid_img = _tessellate_image_layer(
-            tess_img, W, H, cols_target, margin_now,
-            tess_pixelate, block_now
+            tess_imgs, W, H, cols_target, margin_now,
+            tess_pixelate, block_now,
+            tess_per_tile, rng_loc
         )
+        if img_fade_enable:
+            fsrc = float(F.get(img_fade_source, 0.0))
+            # apply shaping: raise to power for sharper response when img_fade_shape is higher
+            shaped = fsrc ** (1.0 + img_fade_shape * 3.0)
+            a_min = img_fade_min / 100.0
+            a_max = max(a_min, img_fade_max / 100.0)
+            alpha_scale = a_min + (a_max - a_min) * shaped
+            grid_img = _apply_alpha(grid_img, alpha_scale)
         canvas.alpha_composite(grid_img)
 
     # draw shapes
